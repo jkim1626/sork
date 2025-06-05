@@ -121,7 +121,7 @@ download_layout = dcc.Tab(
             ])
         ], id="download-container", style={"display": "none"})
     ],
-    label="Download",
+    label="Tab 6",
     id="download-tab",
     style={"padding": "15px"}
 )

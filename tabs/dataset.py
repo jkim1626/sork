@@ -24,6 +24,16 @@ def store_large_df(key, df_dict):
 # Table Options
 table_options = os.getenv("TABLE_OPTIONS").split(",")
 
+table_options_names = {
+    "db_main": "Database Main",
+    "budburst_date1": "Budburst Date 1",
+    "budburst_detailed_all": "Budburst Detailed All",
+    "biomass_2021_combined_fordb_052224": "Biomass",
+    "leaf_traits_2016": "Leaf Traits",
+    "dat_climdb": "Tree Climate Data",
+    "dat_cgp_db": "Garden Temperatures"
+}
+
 joins_layout_dataset = html.Div([
             # Left side - Join configuration
             html.Div([
@@ -197,7 +207,7 @@ joins_layout_dataset = html.Div([
 
 # Layout for Dataset Tab
 dataset_layout = dcc.Tab(
-    label="Tables",
+    label="Tab 2",
     id="dataset-tab",
     style={"padding": "15px"},
     children=[
@@ -209,7 +219,7 @@ dataset_layout = dcc.Tab(
 
         html.Br(),
         html.H4("Table View and Figure Generation", style={"marginBottom": "20px"}),
-        dcc.Dropdown(table_options, id="dataset_dropdown", placeholder="Table Options"),
+        dcc.Dropdown({table: table_options_names[table] for table in table_options}, id="dataset_dropdown", placeholder="Table Options", searchable=False),
         # Column checklist
         html.Div([
             html.Div([
@@ -411,7 +421,7 @@ def update_row_count_info(selected_table):
 def update_output(selected_table, selected_columns, row_count, column_options):
     no_display = {"display": "none"}
     if selected_table is None:
-        return {}, no_display, {"display": "block"}, no_display, no_display, no_display, no_display
+        return {}, no_display, {"display": "block"}, no_display, no_display, no_display, no_display    
     if not selected_columns:
         cols = [opt['value'] for opt in column_options]
     else:
@@ -712,8 +722,6 @@ def execute_join(n_clicks, first_table, join_type, second_table, first_key, seco
                     'backgroundColor': 'rgb(248, 248, 248)'
                 }
             ],
-            filter_action="native",
-            sort_action="native"
         )
         
         # Format the SQL query for display

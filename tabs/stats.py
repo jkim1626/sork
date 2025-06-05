@@ -29,7 +29,7 @@ stat_test_options = [
 
 # Create the layout for the stats tab
 stats_layout = dcc.Tab(
-    label="Statistics",
+    label="Tab 3",
     id="stats-tab",
     style={"padding": "15px"},
     children=[
@@ -296,12 +296,12 @@ def generate_linear_regression(n_clicks, selected_table, x_var, y_var, joined_da
             df = fetch_data_from_sql(query)
         
         # Check if we have enough data
-        if df is None or df.empty:
+        """if df is None or df.empty:
             return html.Div([
                 html.H5("Insufficient Data", style={"color": "red"}),
                 html.P("Not enough valid data points for regression analysis.")
-            ])
-            
+            ])"""
+
         # Calculate regression
         x = df[x_var].values
         y = df[y_var].values

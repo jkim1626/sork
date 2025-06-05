@@ -14,14 +14,23 @@ load_dotenv(override=True)
 table_options = os.getenv("TABLE_OPTIONS", "").split(",")
 default_table = os.getenv("MAIN_TABLE")
 
-db_df = fetch_data_from_sql(f"SELECT TOP 20 * FROM [dbo].[{default_table}]")
+table_options_names = {
+    "db_main": "Database Main",
+    "budburst_date1": "Budburst Date 1",
+    "budburst_detailed_all": "Budburst Detailed All",
+    "biomass_2021_combined_fordb_052224": "Biomass",
+    "leaf_traits_2016": "Leaf Traits",
+    "dat_climdb": "Tree Climate Data",
+    "dat_cgp_db": "Garden Temperatures"
+}
 
 def create_database_Table(num, selected_columns=None, row_count=20):
     if num is None or num < 0 or num >= len(table_options):
         return go.Figure()  # Return empty figure if index is invalid
 
     selected_table = table_options[num]
-    
+    table_name = table_options_names.get(selected_table, selected_table)   
+
     try:
         # Use the row_count parameter to limit the number of rows
         db_df = fetch_data_from_sql(f"SELECT TOP {row_count} * FROM [dbo].[{selected_table}]")
@@ -65,7 +74,7 @@ def create_database_Table(num, selected_columns=None, row_count=20):
         margin={"t":40, "l":0, "r":0, "b":0},  
         height=min(600, 150 + len(db_df) * 25),  
         title={
-            'text': f"Showing {len(db_df)} rows from {selected_table}",
+            'text': f"Showing {len(db_df)} rows from {table_name}",
             'y':0.98,
             'x':0.5,
             'xanchor': 'center',

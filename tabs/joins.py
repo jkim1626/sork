@@ -21,7 +21,7 @@ GARDENS_TABLE="gardens_20152023prismmonthly"
 
 # Create a layout for the joins tab
 joins_layout = dcc.Tab(
-    label="Table Joins",
+    label="Tab 4",
     id="joins-tab",
     style={"padding": "15px"},
     children=[

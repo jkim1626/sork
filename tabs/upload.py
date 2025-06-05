@@ -95,7 +95,7 @@ upload_layout = dcc.Tab(
             
         ], id="upload-container", style={"display": "none"})
     ],
-    label="Upload",
+    label="Tab 5",
     id="upload-tab",
     style={"padding": "15px"}
 )
