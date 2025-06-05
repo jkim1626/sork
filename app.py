@@ -244,7 +244,7 @@ app.layout = serve_layout
 )
 def display_user(tab):
     if 'user' in session:
-        return f"Logged in as [User Name]"
+        return f"[User Name]"
     return "Not logged in"
 
 
