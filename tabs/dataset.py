@@ -1,7 +1,7 @@
 from dash import dcc, html, Input, Output, State, callback, ctx, ALL, MATCH, dash_table, ClientsideFunction
 import dash_bootstrap_components as dbc
 import dash
-from charts import create_database_Table
+#from charts import create_database_Table
 from dotenv import load_dotenv
 from database import fetch_data_from_sql
 from tabs.joins import joins_layout
@@ -239,7 +239,6 @@ dataset_layout = dcc.Tab(
         ]),
         # Data table
         html.Div(html.Div(id="dataset_container", style={"display": "none"}, children=[
-            html.Div(dcc.Graph(id="dataset", style={"marginBottom": "10px"}), style={"overflowX": "auto", "width": "100%"}),
             html.Div(
                 dash_table.DataTable(
                     id='dataset_table',
@@ -255,6 +254,7 @@ dataset_layout = dcc.Tab(
                     style_cell={
                         'padding': '4px 6px',
                         'fontSize': '12px',
+                        'minWidth': '100px',
                         'whiteSpace': 'nowrap',
                         'overflow': 'hidden',
                         'textOverflow': 'ellipsis'
@@ -267,11 +267,10 @@ dataset_layout = dcc.Tab(
                     style_cell_conditional=[
                         {'if': {'column_id': 'selection'}, 'width': '50px'}
                     ],
-                    style_data_conditional=[{
-                        'if': {'state': 'selected'},
-                        'backgroundColor': '#D2E3F6',
-                        'border': '1px solid #1a73e8',
-                    }]
+                    style_data_conditional=[
+                        {'if': {'state': 'selected'}, 'backgroundColor': '#D2E3F6'},
+                        {'if': {'state': 'active'}, 'border': 'inherit'}
+                    ]
                 ),
                 style={"overflowX": "auto", "width": "100%"}
             )
@@ -435,7 +434,7 @@ def update_row_count_info(selected_table):
         return "", 1000
 
 @callback(
-    [Output('dataset', 'figure'), Output('dataset_table', 'data'), Output('dataset_table', 'columns'), Output('row_count_container', 'style'),
+    [Output('dataset_table', 'data'), Output('dataset_table', 'columns'), Output('row_count_container', 'style'),
      Output('placeholder_message', 'style'), Output('dataset_container', 'style'),
      Output('variable_selector', 'style'), Output('generate_button_div', 'style'),
      Output('graph_type_explanation', 'style')],
@@ -445,7 +444,7 @@ def update_row_count_info(selected_table):
 def update_output(selected_table, selected_columns, row_count, column_options):
     no_display = {"display": "none"}
     if selected_table is None:
-        return {}, [], [], no_display, {"display": "block"}, no_display, no_display, no_display, no_display
+        return [], [], no_display, {"display": "block"}, no_display, no_display, no_display, no_display
     if not selected_columns:
         cols = [opt['value'] for opt in column_options]
     else:
@@ -458,8 +457,6 @@ def update_output(selected_table, selected_columns, row_count, column_options):
         row_count = min(row_count, total)
     except:
         pass
-    table_index = table_options.index(selected_table)
-    fig_table = create_database_Table(table_index, cols, row_count)
 
     # Fetch data for DataTable (respect selected columns and row_count)
     try:
@@ -472,7 +469,7 @@ def update_output(selected_table, selected_columns, row_count, column_options):
         print(f"Error fetching table data for DataTable: {e}")
         data, columns = [], []
 
-    return fig_table, data, columns, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
+    return data, columns, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
 
 @callback(
     Output('generate_btn', 'disabled'),
@@ -490,15 +487,16 @@ def toggle_generate_button(x_var, y_var):
     State('y_variable_dropdown', 'value'),
     State('row_count', 'value'),
     # DataTable states to plot selected rows
-    State('dataset_table', 'derived_virtual_data'),
-    State('dataset_table', 'derived_virtual_selected_rows'),
-    State('dataset_table', 'data'),
-    State('dataset_table', 'selected_rows'),
+    State('dataset_table', 'derived_virtual_data'), # data after filtering/sorting
+    State('dataset_table', 'derived_virtual_selected_rows'), # indices of checkbox selected rows
+    State('dataset_table', 'data'), # all raw data
+    State('dataset_table', 'selected_rows'), # checkbox selected rows
+    State('dataset_table', 'selected_cells'), # cell selections
     prevent_initial_call=True
 )
 def generate_figure(n_clicks, selected_table, x_var, y_var, row_count,
                     derived_virtual_data, derived_virtual_selected_rows,
-                    raw_data, raw_selected_rows):
+                    raw_data, raw_selected_rows, selected_cells):
     if not n_clicks or n_clicks == 0 or selected_table is None or x_var is None or y_var is None:
         return [], {"display": "none"}
     
@@ -507,25 +505,24 @@ def generate_figure(n_clicks, selected_table, x_var, y_var, row_count,
     df = None
     col1, col2 = x_var, y_var
 
+    # uses data from filtered and checked rows
+    if derived_virtual_selected_rows and len(derived_virtual_selected_rows) > 0:
+        df = pd.DataFrame(derived_virtual_data).iloc[derived_virtual_selected_rows]
+
     # uses data from selecting check box rows
-    if raw_selected_rows is not None and len(raw_selected_rows) > 0:
-        try:
-            table_source = derived_virtual_data if derived_virtual_data is not None else raw_data
-            if table_source:
-                df = pd.DataFrame(table_source)
-                if col1 in df.columns and col2 in df.columns:
-                    df = df.iloc[raw_selected_rows][[col1, col2]].dropna()
-                else:
-                    df = None
-        except Exception as e:
-            print(f"Error using DataTable raw selected rows: {e}")
+    elif raw_selected_rows and len(raw_selected_rows) > 0:
+        df = pd.DataFrame(raw_data).iloc[raw_selected_rows]
+
+    # uses filtered data
+    elif derived_virtual_data and len(derived_virtual_data) > 0:
+        df = pd.DataFrame(derived_virtual_data)
     
     # use all raw data
-    elif raw_data is not None and len(raw_data) > 0:
+    elif raw_data and len(raw_data) > 0:
         df = pd.DataFrame(raw_data)
     
+    # Fallback to fetch data from SQL
     else:
-        # Fallback to SQL fetch when no selection available or selection invalid
         if df is None:
             if selected_table:
                 query = f"SELECT TOP {row_count} [{col1}], [{col2}] FROM [dbo].[{selected_table}]"
