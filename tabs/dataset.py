@@ -239,8 +239,42 @@ dataset_layout = dcc.Tab(
         ]),
         # Data table
         html.Div(html.Div(id="dataset_container", style={"display": "none"}, children=[
-            html.Div(dcc.Graph(id="dataset", style={"marginBottom": "10px"}),
-                    style={"overflowX": "auto", "width": "100%"})
+            html.Div(dcc.Graph(id="dataset", style={"marginBottom": "10px"}), style={"overflowX": "auto", "width": "100%"}),
+            html.Div(
+                dash_table.DataTable(
+                    id='dataset_table',
+                    data=[],
+                    columns=[],
+                    page_size=20,
+                    filter_action='native',
+                    sort_action='native',
+                    row_selectable='multi',
+                    selected_rows=[],
+                    cell_selectable=True,
+                    style_table={'overflowX': 'auto', 'marginTop': '8px'},
+                    style_cell={
+                        'padding': '4px 6px',
+                        'fontSize': '12px',
+                        'whiteSpace': 'nowrap',
+                        'overflow': 'hidden',
+                        'textOverflow': 'ellipsis'
+                    },
+                    style_header={
+                        'backgroundColor': '#f8f9fa',
+                        'fontWeight': 'bold',
+                        'padding': '10px',
+                    },
+                    style_cell_conditional=[
+                        {'if': {'column_id': 'selection'}, 'width': '50px'}
+                    ],
+                    style_data_conditional=[{
+                        'if': {'state': 'selected'},
+                        'backgroundColor': '#D2E3F6',
+                        'border': '1px solid #1a73e8',
+                    }]
+                ),
+                style={"overflowX": "auto", "width": "100%"}
+            )
         ]), style={"maxHeight": "800px", "overflowY": "auto", "backgroundColor": "#e5ecf6", "padding": "10px", "borderRadius": "5px", "border": "1px solid #d1d1d1"}),
         
         # Variable selectors for plotting
@@ -401,7 +435,7 @@ def update_row_count_info(selected_table):
         return "", 1000
 
 @callback(
-    [Output('dataset', 'figure'), Output('row_count_container', 'style'),
+    [Output('dataset', 'figure'), Output('dataset_table', 'data'), Output('dataset_table', 'columns'), Output('row_count_container', 'style'),
      Output('placeholder_message', 'style'), Output('dataset_container', 'style'),
      Output('variable_selector', 'style'), Output('generate_button_div', 'style'),
      Output('graph_type_explanation', 'style')],
@@ -411,7 +445,7 @@ def update_row_count_info(selected_table):
 def update_output(selected_table, selected_columns, row_count, column_options):
     no_display = {"display": "none"}
     if selected_table is None:
-        return {}, no_display, {"display": "block"}, no_display, no_display, no_display, no_display
+        return {}, [], [], no_display, {"display": "block"}, no_display, no_display, no_display, no_display
     if not selected_columns:
         cols = [opt['value'] for opt in column_options]
     else:
@@ -426,7 +460,19 @@ def update_output(selected_table, selected_columns, row_count, column_options):
         pass
     table_index = table_options.index(selected_table)
     fig_table = create_database_Table(table_index, cols, row_count)
-    return fig_table, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
+
+    # Fetch data for DataTable (respect selected columns and row_count)
+    try:
+        cols_sql = ", ".join([f"[{c}]" for c in cols]) if cols else "*"
+        query = f"SELECT TOP {row_count} {cols_sql} FROM [dbo].[{selected_table}]"
+        df = fetch_data_from_sql(query)
+        data = df.to_dict('records')
+        columns = [{'name': c, 'id': c} for c in df.columns]
+    except Exception as e:
+        print(f"Error fetching table data for DataTable: {e}")
+        data, columns = [], []
+
+    return fig_table, data, columns, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
 
 @callback(
     Output('generate_btn', 'disabled'),
@@ -443,19 +489,49 @@ def toggle_generate_button(x_var, y_var):
     State('x_variable_dropdown', 'value'),
     State('y_variable_dropdown', 'value'),
     State('row_count', 'value'),
+    # DataTable states to plot selected rows
+    State('dataset_table', 'derived_virtual_data'),
+    State('dataset_table', 'derived_virtual_selected_rows'),
+    State('dataset_table', 'data'),
+    State('dataset_table', 'selected_rows'),
     prevent_initial_call=True
 )
-def generate_figure(n_clicks, selected_table, x_var, y_var, row_count):
+def generate_figure(n_clicks, selected_table, x_var, y_var, row_count,
+                    derived_virtual_data, derived_virtual_selected_rows,
+                    raw_data, raw_selected_rows):
     if not n_clicks or n_clicks == 0 or selected_table is None or x_var is None or y_var is None:
         return [], {"display": "none"}
     
     # Generate different data frame if the joined one is stored
-    if selected_table:
-        col1, col2 = x_var, y_var
-        query = f"SELECT TOP {row_count} [{col1}], [{col2}] FROM [dbo].[{selected_table}]"
-        df = fetch_data_from_sql(query)[[col1, col2]].dropna()
+    
+    df = None
+    col1, col2 = x_var, y_var
+
+    # uses data from selecting check box rows
+    if raw_selected_rows is not None and len(raw_selected_rows) > 0:
+        try:
+            table_source = derived_virtual_data if derived_virtual_data is not None else raw_data
+            if table_source:
+                df = pd.DataFrame(table_source)
+                if col1 in df.columns and col2 in df.columns:
+                    df = df.iloc[raw_selected_rows][[col1, col2]].dropna()
+                else:
+                    df = None
+        except Exception as e:
+            print(f"Error using DataTable raw selected rows: {e}")
+    
+    # use all raw data
+    elif raw_data is not None and len(raw_data) > 0:
+        df = pd.DataFrame(raw_data)
+    
     else:
-        return [], {"display": "none"}
+        # Fallback to SQL fetch when no selection available or selection invalid
+        if df is None:
+            if selected_table:
+                query = f"SELECT TOP {row_count} [{col1}], [{col2}] FROM [dbo].[{selected_table}]"
+                df = fetch_data_from_sql(query)[[col1, col2]].dropna()
+        else:
+            return [], {"display": "none"}
     
     num1, num2 = is_numeric_dtype(df[col1]), is_numeric_dtype(df[col2])
     
