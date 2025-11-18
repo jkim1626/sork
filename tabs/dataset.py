@@ -228,6 +228,18 @@ dataset_layout = dcc.Tab(
                     style={"width": "100px", "margin": "10px 0"}),
             html.Span(id="max_rows_info", style={"marginLeft": "10px", "color": "#666", "fontSize": "0.9em"}),
         ], id="row_count_container", style={"display": "none"}),
+        # Filtering usage info
+        html.Div([
+            html.P("Enter filtering queries for each column in the second row of the table. The displayed data will be used for figure generation."),
+            html.P("Use operators like >, <, >=, <=, != for numerical columns. For text columns, use 'contains', 'startswith', 'endswith'.")
+        ], id="filtering_usage_info", style={"display": "none"}),
+        # Filter and selection counts
+        html.Div([
+            html.Span(id='filter_count_text', style={"marginRight": "20px", "fontWeight": "bold"}),
+            html.Span(id='selected_count_text', style={"fontWeight": "bold", "marginRight": "12px"}),
+            html.Button("Deselect All Rows", id="deselect_all_rows_btn", n_clicks=0,
+                        style={"fontSize": "0.9em", "padding": "3px 8px", "backgroundColor": "#f0f0f0", "border": "1px solid #ccc", "borderRadius": "4px"})
+        ], id="filter_selection_counts", style={"display": "none"}),
         # Placeholder message
         html.Div(id="placeholder_message", children=[
             html.H5(
@@ -275,7 +287,7 @@ dataset_layout = dcc.Tab(
                 style={"overflowX": "auto", "width": "100%"}
             )
         ]), style={"maxHeight": "800px", "overflowY": "auto", "backgroundColor": "#e5ecf6", "padding": "10px", "borderRadius": "5px", "border": "1px solid #d1d1d1"}),
-        
+
         # Variable selectors for plotting
         html.Div([
             html.Label("Select variables to plot selected rows:", style={"fontWeight": "bold", "marginBottom": "5px"}),
@@ -435,6 +447,7 @@ def update_row_count_info(selected_table):
 
 @callback(
     [Output('dataset_table', 'data'), Output('dataset_table', 'columns'), Output('row_count_container', 'style'),
+     Output('filtering_usage_info', 'style'), Output('filter_selection_counts', 'style'),
      Output('placeholder_message', 'style'), Output('dataset_container', 'style'),
      Output('variable_selector', 'style'), Output('generate_button_div', 'style'),
      Output('graph_type_explanation', 'style')],
@@ -444,7 +457,7 @@ def update_row_count_info(selected_table):
 def update_output(selected_table, selected_columns, row_count, column_options):
     no_display = {"display": "none"}
     if selected_table is None:
-        return [], [], no_display, {"display": "block"}, no_display, no_display, no_display, no_display
+        return [], [], no_display, no_display, no_display, {"display": "block"}, no_display, no_display, no_display, no_display
     if not selected_columns:
         cols = [opt['value'] for opt in column_options]
     else:
@@ -469,7 +482,35 @@ def update_output(selected_table, selected_columns, row_count, column_options):
         print(f"Error fetching table data for DataTable: {e}")
         data, columns = [], []
 
-    return data, columns, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
+    return data, columns, {"display": "block", "margin": "10px 0"}, {"display": "block"}, {"display": "block"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
+
+# Display counts for filtered rows and checkbox selection
+@callback(
+    [Output('filter_count_text', 'children'), Output('selected_count_text', 'children')],
+    [Input('dataset_table', 'derived_virtual_data'), Input('dataset_table', 'selected_rows'), Input('dataset_table', 'data')]
+)
+def update_table_counts(derived_virtual_data, selected_rows, raw_data):
+    if derived_virtual_data is None:
+        filtered_count = len(raw_data) if raw_data else 0
+    else:
+        filtered_count = len(derived_virtual_data)
+
+    selected_count = len(selected_rows) if selected_rows else 0
+
+    filter_text = f"Filtered rows: {filtered_count}"
+    selected_text = f"Selected rows: {selected_count}"
+    return filter_text, selected_text
+
+# Deselect all rows from DataTable
+@callback(
+    Output('dataset_table', 'selected_rows'),
+    Input('deselect_all_rows_btn', 'n_clicks'),
+    prevent_initial_call=True
+)
+def deselect_all_rows(n_clicks):
+    if not n_clicks or n_clicks == 0:
+        return dash.no_update
+    return []
 
 @callback(
     Output('generate_btn', 'disabled'),
