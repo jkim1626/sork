@@ -1,4 +1,5 @@
 from dash import dcc, html, Input, Output, State, callback, ctx, ALL, MATCH, dash_table, ClientsideFunction
+from dash_ag_grid import AgGrid
 import dash_bootstrap_components as dbc
 import dash
 from charts import create_database_Table
@@ -237,11 +238,37 @@ dataset_layout = dcc.Tab(
             # Error message area
             html.Div(id="dataset-error-message", style={"color": "red", "marginTop": "20px", "fontWeight": "bold"})
         ]),
-        # Data table
-        html.Div(html.Div(id="dataset_container", style={"display": "none"}, children=[
-            html.Div(dcc.Graph(id="dataset", style={"marginBottom": "10px"}),
-                    style={"overflowX": "auto", "width": "100%"})
-        ]), style={"maxHeight": "800px", "overflowY": "auto", "backgroundColor": "#e5ecf6", "padding": "10px", "borderRadius": "5px", "border": "1px solid #d1d1d1"}),
+        # AG Grid table
+        html.Div([
+            html.Div([
+                # filter and selection counts
+                html.Span(id='filter_count_text', style={"marginRight": "20px", "fontWeight": "bold"}),
+                html.Span(id='selected_count_text', style={"fontWeight": "bold", "marginRight": "12px"}),
+                html.Button("Deselect All Rows", id="deselect_all_rows", n_clicks=0,
+                            style={"fontSize": "0.9em", "padding": "3px 8px", "backgroundColor": "#f0f0f0", "border": "1px solid #ccc", "borderRadius": "4px"})
+            ], style={"marginBottom": "8px"}),
+            html.Div(id="dataset_container", style={"display": "none"}, children=[
+                html.Div(
+                    AgGrid(
+                        id='dataset_grid',
+                        rowData=[],
+                        columnDefs=[],
+                        defaultColDef={
+                            'filter': True,
+                            'sortable': True,
+                            'resizable': True,
+                            'minWidth': 20
+                        },
+                        dashGridOptions={'rowSelection': 'multiple'},
+                        selectedRows=[],
+                        className='ag-theme-alpine',
+                        style={'width': '100%', 'height': '400px'},
+                        enableEnterpriseModules=False,
+                    ),
+                    style={"overflowX": "auto", "width": "100%"}
+                )
+            ])
+        ], style={"maxHeight": "800px", "overflowY": "auto", "backgroundColor": "#e5ecf6", "padding": "10px", "borderRadius": "5px", "border": "1px solid #d1d1d1"}),
         
         # Variable selectors for plotting
         html.Div([
@@ -294,6 +321,51 @@ dataset_layout = dcc.Tab(
         html.Div(id="join-error-message", style={"color": "red", "marginTop": "20px", "fontWeight": "bold"}),
     ]
 )
+
+# Helper function to apply filters from AG Grid table
+# Supports common text and number filter types
+def apply_filter_model(df, filter_model):
+    for field, model in (filter_model or {}).items():
+        if field not in df.columns:
+            continue
+        # Text filter
+        if model.get('filterType') == 'text' or isinstance(df[field].dtype, object):
+            fval = str(model.get('filter', ''))
+            ftype = model.get('type', 'contains')
+            if ftype == 'contains':
+                df = df[df[field].astype(str).str.contains(fval, na=False, case=False)]
+            elif ftype == 'equals':
+                df = df[df[field].astype(str) == fval]
+            elif ftype == 'notEqual':
+                df = df[df[field].astype(str) != fval]
+            elif ftype == 'startsWith':
+                df = df[df[field].astype(str).str.startswith(fval, na=False)]
+            elif ftype == 'endsWith':
+                df = df[df[field].astype(str).str.endswith(fval, na=False)]
+            else:
+                # Default to contains
+                df = df[df[field].astype(str).str.contains(fval, na=False, case=False)]
+        else:
+            # Numeric filter
+            comp = model.get('type')
+            val = model.get('filter')
+            if val is None:
+                continue
+            val = float(val)
+            if comp == 'lessThan':
+                df = df[pd.to_numeric(df[field], errors='coerce') < val]
+            elif comp == 'lessThanOrEqual':
+                df = df[pd.to_numeric(df[field], errors='coerce') <= val]
+            elif comp == 'greaterThan':
+                df = df[pd.to_numeric(df[field], errors='coerce') > val]
+            elif comp == 'greaterThanOrEqual':
+                df = df[pd.to_numeric(df[field], errors='coerce') >= val]
+            elif comp == 'equals':
+                df = df[pd.to_numeric(df[field], errors='coerce') == val]
+            elif comp == 'notEqual':
+                df = df[pd.to_numeric(df[field], errors='coerce') != val]
+    return df
+
 
 # Callbacks
 
@@ -401,17 +473,17 @@ def update_row_count_info(selected_table):
         return "", 1000
 
 @callback(
-    [Output('dataset', 'figure'), Output('row_count_container', 'style'),
+    [Output('dataset_grid', 'rowData'), Output('dataset_grid', 'columnDefs'), Output('row_count_container', 'style'),
      Output('placeholder_message', 'style'), Output('dataset_container', 'style'),
      Output('variable_selector', 'style'), Output('generate_button_div', 'style'),
-     Output('graph_type_explanation', 'style')],
+     Output('graph_type_explanation', 'style'), Output('deselect_all_rows', 'style')],
     [Input('dataset_dropdown', 'value'), Input('options', 'value'), Input('row_count', 'value')],
     State('options', 'options')
 )
 def update_output(selected_table, selected_columns, row_count, column_options):
     no_display = {"display": "none"}
     if selected_table is None:
-        return {}, no_display, {"display": "block"}, no_display, no_display, no_display, no_display
+        return [], [], no_display, {"display": "block"}, no_display, no_display, no_display, no_display, {"display": "none"}
     if not selected_columns:
         cols = [opt['value'] for opt in column_options]
     else:
@@ -424,9 +496,19 @@ def update_output(selected_table, selected_columns, row_count, column_options):
         row_count = min(row_count, total)
     except:
         pass
-    table_index = table_options.index(selected_table)
-    fig_table = create_database_Table(table_index, cols, row_count)
-    return fig_table, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
+
+    # Fetch data slice for AG Grid
+    try:
+        cols_sql = ", ".join([f"[{c}]" for c in cols]) if cols else "*"
+        query = f"SELECT TOP {row_count} {cols_sql} FROM [dbo].[{selected_table}]"
+        df = fetch_data_from_sql(query)
+        row_data = df.to_dict('records')
+        column_defs = [{'headerName': c, 'field': c} for c in df.columns]
+    except Exception as e:
+        print(f"Error fetching table data for AgGrid: {e}")
+        row_data, column_defs = [], []
+
+    return row_data, column_defs, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "inline-block"}
 
 @callback(
     Output('generate_btn', 'disabled'),
@@ -436,6 +518,37 @@ def toggle_generate_button(x_var, y_var):
     return not (x_var and y_var)
 
 @callback(
+    Output('dataset_grid', 'selectedRows'),
+    Input('deselect_all_rows', 'n_clicks'),
+    prevent_initial_call=True
+)
+def deselect_all_rows(n_clicks):
+    if not n_clicks or n_clicks == 0:
+        return dash.no_update
+    return []
+
+# Update filter and selection counts
+@callback(
+    [Output('filter_count_text', 'children'), Output('selected_count_text', 'children')],
+    [Input('dataset_grid', 'rowData'), Input('dataset_grid', 'selectedRows'), Input('dataset_grid', 'filterModel')]
+)
+def update_table_counts(row_data, selected_rows, filter_model):
+    if not row_data:
+        return "", ""
+    
+    df = pd.DataFrame(row_data)
+
+    if filter_model:
+        filtered = apply_filter_model(df, filter_model)
+    else:
+        filtered = df
+
+    filtered_count = len(filtered)
+    selected_count = len(selected_rows) if selected_rows else 0
+
+    return f"Filtered rows: {filtered_count}", f"Selected rows: {selected_count}"
+
+@callback(
     [Output('figure_div', 'children', allow_duplicate=True), 
      Output('figure_div', 'style', allow_duplicate=True)],
     Input('generate_btn', 'n_clicks'),
@@ -443,19 +556,41 @@ def toggle_generate_button(x_var, y_var):
     State('x_variable_dropdown', 'value'),
     State('y_variable_dropdown', 'value'),
     State('row_count', 'value'),
+    State('dataset_grid', 'rowData'), State('dataset_grid', 'selectedRows'), State('dataset_grid', 'filterModel'),
     prevent_initial_call=True
 )
-def generate_figure(n_clicks, selected_table, x_var, y_var, row_count):
+def generate_figure(n_clicks, selected_table, x_var, y_var, row_count, row_data, selected_rows, filter_model):
     if not n_clicks or n_clicks == 0 or selected_table is None or x_var is None or y_var is None:
         return [], {"display": "none"}
     
     # Generate different data frame if the joined one is stored
-    if selected_table:
-        col1, col2 = x_var, y_var
-        query = f"SELECT TOP {row_count} [{col1}], [{col2}] FROM [dbo].[{selected_table}]"
-        df = fetch_data_from_sql(query)[[col1, col2]].dropna()
+    col1, col2 = x_var, y_var
+
+    df = None
+
+    # first use user selected rows if any
+    if selected_rows and len(selected_rows) > 0:
+        df = pd.DataFrame(selected_rows)
+
+    # next apply filter model to full row data if any
+    elif (df is None or df.empty) and row_data:
+        tmp = pd.DataFrame(row_data)
+        if filter_model:
+            tmp = apply_filter_model(tmp, filter_model)
+        if not tmp.empty:
+            df = tmp
+
+    # next try full row data
+    elif (df is None or df.empty) and row_data:
+        df = pd.DataFrame(row_data)
+
+    # fallback to fetch minimal columns from SQL
     else:
-        return [], {"display": "none"}
+        if selected_table:
+            query = f"SELECT TOP {row_count} [{col1}], [{col2}] FROM [dbo].[{selected_table}]"
+            df = fetch_data_from_sql(query)[[col1, col2]].dropna()
+        else:
+            return [], {"display": "none"}
     
     num1, num2 = is_numeric_dtype(df[col1]), is_numeric_dtype(df[col2])
     
