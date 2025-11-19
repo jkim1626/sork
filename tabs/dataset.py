@@ -1,7 +1,7 @@
 from dash import dcc, html, Input, Output, State, callback, ctx, ALL, MATCH, dash_table, ClientsideFunction
 import dash_bootstrap_components as dbc
 import dash
-from charts import create_database_Table
+#from charts import create_database_Table
 from dotenv import load_dotenv
 from database import fetch_data_from_sql
 from tabs.joins import joins_layout
@@ -228,6 +228,18 @@ dataset_layout = dcc.Tab(
                     style={"width": "100px", "margin": "10px 0"}),
             html.Span(id="max_rows_info", style={"marginLeft": "10px", "color": "#666", "fontSize": "0.9em"}),
         ], id="row_count_container", style={"display": "none"}),
+        # Filtering usage info
+        html.Div([
+            html.P("Enter filtering queries for each column in the second row of the table. The displayed data will be used for figure generation."),
+            html.P("Use operators like >, <, >=, <=, != for numerical columns. For text columns, use 'contains', 'startswith', 'endswith'.")
+        ], id="filtering_usage_info", style={"display": "none"}),
+        # Filter and selection counts
+        html.Div([
+            html.Span(id='filter_count_text', style={"marginRight": "20px", "fontWeight": "bold"}),
+            html.Span(id='selected_count_text', style={"fontWeight": "bold", "marginRight": "12px"}),
+            html.Button("Deselect All Rows", id="deselect_all_rows_btn", n_clicks=0,
+                        style={"fontSize": "0.9em", "padding": "3px 8px", "backgroundColor": "#f0f0f0", "border": "1px solid #ccc", "borderRadius": "4px"})
+        ], id="filter_selection_counts", style={"display": "none"}),
         # Placeholder message
         html.Div(id="placeholder_message", children=[
             html.H5(
@@ -239,10 +251,43 @@ dataset_layout = dcc.Tab(
         ]),
         # Data table
         html.Div(html.Div(id="dataset_container", style={"display": "none"}, children=[
-            html.Div(dcc.Graph(id="dataset", style={"marginBottom": "10px"}),
-                    style={"overflowX": "auto", "width": "100%"})
+            html.Div(
+                dash_table.DataTable(
+                    id='dataset_table',
+                    data=[],
+                    columns=[],
+                    page_size=20,
+                    filter_action='native',
+                    sort_action='native',
+                    row_selectable='multi',
+                    selected_rows=[],
+                    cell_selectable=True,
+                    style_table={'overflowX': 'auto', 'marginTop': '8px'},
+                    style_cell={
+                        'padding': '4px 6px',
+                        'fontSize': '12px',
+                        'minWidth': '100px',
+                        'whiteSpace': 'nowrap',
+                        'overflow': 'hidden',
+                        'textOverflow': 'ellipsis'
+                    },
+                    style_header={
+                        'backgroundColor': '#f8f9fa',
+                        'fontWeight': 'bold',
+                        'padding': '10px',
+                    },
+                    style_cell_conditional=[
+                        {'if': {'column_id': 'selection'}, 'width': '50px'}
+                    ],
+                    style_data_conditional=[
+                        {'if': {'state': 'selected'}, 'backgroundColor': '#D2E3F6'},
+                        {'if': {'state': 'active'}, 'border': 'inherit'}
+                    ]
+                ),
+                style={"overflowX": "auto", "width": "100%"}
+            )
         ]), style={"maxHeight": "800px", "overflowY": "auto", "backgroundColor": "#e5ecf6", "padding": "10px", "borderRadius": "5px", "border": "1px solid #d1d1d1"}),
-        
+
         # Variable selectors for plotting
         html.Div([
             html.Label("Select variables to plot selected rows:", style={"fontWeight": "bold", "marginBottom": "5px"}),
@@ -401,7 +446,8 @@ def update_row_count_info(selected_table):
         return "", 1000
 
 @callback(
-    [Output('dataset', 'figure'), Output('row_count_container', 'style'),
+    [Output('dataset_table', 'data'), Output('dataset_table', 'columns'), Output('row_count_container', 'style'),
+     Output('filtering_usage_info', 'style'), Output('filter_selection_counts', 'style'),
      Output('placeholder_message', 'style'), Output('dataset_container', 'style'),
      Output('variable_selector', 'style'), Output('generate_button_div', 'style'),
      Output('graph_type_explanation', 'style')],
@@ -411,7 +457,7 @@ def update_row_count_info(selected_table):
 def update_output(selected_table, selected_columns, row_count, column_options):
     no_display = {"display": "none"}
     if selected_table is None:
-        return {}, no_display, {"display": "block"}, no_display, no_display, no_display, no_display
+        return [], [], no_display, no_display, no_display, {"display": "block"}, no_display, no_display, no_display, no_display
     if not selected_columns:
         cols = [opt['value'] for opt in column_options]
     else:
@@ -424,9 +470,47 @@ def update_output(selected_table, selected_columns, row_count, column_options):
         row_count = min(row_count, total)
     except:
         pass
-    table_index = table_options.index(selected_table)
-    fig_table = create_database_Table(table_index, cols, row_count)
-    return fig_table, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
+
+    # Fetch data for DataTable (respect selected columns and row_count)
+    try:
+        cols_sql = ", ".join([f"[{c}]" for c in cols]) if cols else "*"
+        query = f"SELECT TOP {row_count} {cols_sql} FROM [dbo].[{selected_table}]"
+        df = fetch_data_from_sql(query)
+        data = df.to_dict('records')
+        columns = [{'name': c, 'id': c} for c in df.columns]
+    except Exception as e:
+        print(f"Error fetching table data for DataTable: {e}")
+        data, columns = [], []
+
+    return data, columns, {"display": "block", "margin": "10px 0"}, {"display": "block"}, {"display": "block"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
+
+# Display counts for filtered rows and checkbox selection
+@callback(
+    [Output('filter_count_text', 'children'), Output('selected_count_text', 'children')],
+    [Input('dataset_table', 'derived_virtual_data'), Input('dataset_table', 'selected_rows'), Input('dataset_table', 'data')]
+)
+def update_table_counts(derived_virtual_data, selected_rows, raw_data):
+    if derived_virtual_data is None:
+        filtered_count = len(raw_data) if raw_data else 0
+    else:
+        filtered_count = len(derived_virtual_data)
+
+    selected_count = len(selected_rows) if selected_rows else 0
+
+    filter_text = f"Filtered rows: {filtered_count}"
+    selected_text = f"Selected rows: {selected_count}"
+    return filter_text, selected_text
+
+# Deselect all rows from DataTable
+@callback(
+    Output('dataset_table', 'selected_rows'),
+    Input('deselect_all_rows_btn', 'n_clicks'),
+    prevent_initial_call=True
+)
+def deselect_all_rows(n_clicks):
+    if not n_clicks or n_clicks == 0:
+        return dash.no_update
+    return []
 
 @callback(
     Output('generate_btn', 'disabled'),
@@ -443,19 +527,49 @@ def toggle_generate_button(x_var, y_var):
     State('x_variable_dropdown', 'value'),
     State('y_variable_dropdown', 'value'),
     State('row_count', 'value'),
+    # DataTable states to plot selected rows
+    State('dataset_table', 'derived_virtual_data'), # data after filtering/sorting
+    State('dataset_table', 'derived_virtual_selected_rows'), # indices of checkbox selected rows
+    State('dataset_table', 'data'), # all raw data
+    State('dataset_table', 'selected_rows'), # checkbox selected rows
+    State('dataset_table', 'selected_cells'), # cell selections
     prevent_initial_call=True
 )
-def generate_figure(n_clicks, selected_table, x_var, y_var, row_count):
+def generate_figure(n_clicks, selected_table, x_var, y_var, row_count,
+                    derived_virtual_data, derived_virtual_selected_rows,
+                    raw_data, raw_selected_rows, selected_cells):
     if not n_clicks or n_clicks == 0 or selected_table is None or x_var is None or y_var is None:
         return [], {"display": "none"}
     
     # Generate different data frame if the joined one is stored
-    if selected_table:
-        col1, col2 = x_var, y_var
-        query = f"SELECT TOP {row_count} [{col1}], [{col2}] FROM [dbo].[{selected_table}]"
-        df = fetch_data_from_sql(query)[[col1, col2]].dropna()
+    
+    df = None
+    col1, col2 = x_var, y_var
+
+    # uses data from filtered and checked rows
+    if derived_virtual_selected_rows and len(derived_virtual_selected_rows) > 0:
+        df = pd.DataFrame(derived_virtual_data).iloc[derived_virtual_selected_rows]
+
+    # uses data from selecting check box rows
+    elif raw_selected_rows and len(raw_selected_rows) > 0:
+        df = pd.DataFrame(raw_data).iloc[raw_selected_rows]
+
+    # uses filtered data
+    elif derived_virtual_data and len(derived_virtual_data) > 0:
+        df = pd.DataFrame(derived_virtual_data)
+    
+    # use all raw data
+    elif raw_data and len(raw_data) > 0:
+        df = pd.DataFrame(raw_data)
+    
+    # Fallback to fetch data from SQL
     else:
-        return [], {"display": "none"}
+        if df is None:
+            if selected_table:
+                query = f"SELECT TOP {row_count} [{col1}], [{col2}] FROM [dbo].[{selected_table}]"
+                df = fetch_data_from_sql(query)[[col1, col2]].dropna()
+        else:
+            return [], {"display": "none"}
     
     num1, num2 = is_numeric_dtype(df[col1]), is_numeric_dtype(df[col2])
     
