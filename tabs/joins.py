@@ -8,6 +8,8 @@ import pandas as pd
 # Load environment variables
 load_dotenv(override=True)
 
+PREVIEW_LIMIT = 1000
+
 CORE_TABLES={
     "db_main": "Growth/Survival",
     "budburst_detailed_all": "All Budburst Stages",
@@ -337,13 +339,13 @@ def execute_join(n_clicks, core_table, core_table_vars, maternal_tree_vars, gard
                          "[Locality]"] \
                         + [f"[{c}]" for c in safe_tree_vars]
             joins.append(f"""
-LEFT JOIN (
-  SELECT {', '.join(tree_cols)}
-  FROM [dbo].[{MATERNAL_TREE_TABLE}]
-) maternal
-  ON core.[Accession] = maternal.[Accession]
- AND core.[Locality]  = maternal.[Locality]
-""".strip())
+                LEFT JOIN (
+                SELECT {', '.join(tree_cols)}
+                FROM [dbo].[{MATERNAL_TREE_TABLE}]
+                ) maternal
+                ON core.[Accession] = maternal.[Accession]
+                AND core.[Locality]  = maternal.[Locality]
+                """.strip())
 
         # 5) Garden‐climate join
         if garden_climate_vars:
@@ -363,37 +365,40 @@ LEFT JOIN (
                 join_cond   = "core.[Year] = garden.[Year] AND core.[Site] = garden.[Site]"
 
             joins.append(f"""
-LEFT JOIN (
-  SELECT {', '.join(garden_cols)}
-  FROM [dbo].[{GARDENS_TABLE}]
-) garden
-  ON {join_cond}
-""".strip())
+                LEFT JOIN (
+                SELECT {', '.join(garden_cols)}
+                FROM [dbo].[{GARDENS_TABLE}]
+                ) garden
+                ON {join_cond}
+                """.strip())
 
         # 6) Assemble & run
-        sql_query = f"""
-SELECT DISTINCT
-  {', '.join(selected_clauses)}
-FROM [dbo].[{core_table}] core
-{chr(10).join(joins)}
-""".strip()
-        result_df = fetch_data_from_sql(sql_query)
+        full_sql_query = f"""
+            SELECT DISTINCT
+            {', '.join(selected_clauses)}
+            FROM [dbo].[{core_table}] core
+            {chr(10).join(joins)}
+            """.strip()
+        
+        # Limit preview
+        preview_sql = f"SELECT DISTINCT TOP {PREVIEW_LIMIT} {', '.join(selected_clauses)} FROM [dbo].[{core_table}] core {chr(10).join(joins)}"
+        result_df = fetch_data_from_sql(preview_sql)
 
-        # 7) If nothing came back, hide and exit
+        # 7) If nothing came back, hide and exit, return the full SQL for user inspection
         if result_df is None or result_df.empty:
-            return {"display": "none"}, [], sql_query, ""
+            return {"display": "none"}, [], full_sql_query, ""
 
-        # 8) Build the table and stats
+        # 8) Build the preview table and stats
         table = dash_table.DataTable(
-            data=result_df.head(1000).to_dict("records"),
+            data=result_df.to_dict("records"),
             columns=[{"name": c, "id": c} for c in result_df.columns],
             page_size=15,
             style_table={"overflowX": "auto"},
         )
-        stats_text = f"{len(result_df)} rows | {len(core_cols)} core cols | " \
+        stats_text = f"Previewing {len(result_df)} rows | {len(core_cols)} core cols | " \
                      f"{len(safe_tree_vars)} maternal cols | {len(safe_garden_vars)} garden cols"
 
-        return {"display": "block"}, table, sql_query, stats_text
+        return {"display": "block"}, table, full_sql_query, stats_text
 
     except Exception as e:
         err = f"Error executing join: {e}"
