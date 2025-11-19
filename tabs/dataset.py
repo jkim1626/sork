@@ -1,6 +1,7 @@
 from dash import dcc, html, Input, Output, State, callback, ctx, ALL, MATCH, dash_table, ClientsideFunction
 import dash_bootstrap_components as dbc
 import dash
+import dash_ag_grid as dag # ag grid
 from charts import create_database_Table
 from dotenv import load_dotenv
 from database import fetch_data_from_sql
@@ -20,6 +21,64 @@ load_dotenv(override=True)
 def store_large_df(key, df_dict):
     print("Storing to cache with key:", key)
     cache.set(key, df_dict, timeout=3600)
+
+
+def build_ag_grid(df: pd.DataFrame, grid_id: str = None, page_size: int = 15):
+    """Build a dash_ag_grid AgGrid component from a DataFrame with selection checkboxes.
+
+    - Adds a left checkbox column for selection and header checkbox for select-all.
+    - Enables multi-row selection and range selection.
+    """
+    if df is None or df.empty:
+        return html.Div("No data to display")
+
+    cols = df.columns.tolist()
+    columnDefs = []
+
+    # Add checkbox selection column
+    columnDefs.append({
+        "headerName": "",
+        "checkboxSelection": True,
+        "headerCheckboxSelection": True,
+        "width": 40,
+        "pinned": "left",
+    })
+
+    for c in cols:
+        col_def = {
+            "field": c,
+            "headerName": c,
+            "filter": True,
+            "sortable": True,
+            "resizable": True,
+        }
+        try:
+            if pd.api.types.is_numeric_dtype(df[c]):
+                col_def["filter"] = "agNumberColumnFilter"
+        except Exception:
+            pass
+        columnDefs.append(col_def)
+
+    grid = dag.AgGrid(
+        id=grid_id or f"ag-grid-{str(uuid.uuid4())}",
+        columnDefs=columnDefs,
+        rowData=df.to_dict("records"),
+        defaultColDef={"flex": 1, "minWidth": 100, "filter": True, "sortable": True, "resizable": True},
+        dashGridOptions={
+            "enableRangeSelection": True,
+            "rowSelection": "multiple",
+            "rowMultiSelectWithClick": True,
+            "rowDeselection": True,
+            "suppressRowClickSelection": False,
+            "enableColResize": True,
+            "pagination": True,
+            "paginationPageSize": page_size,
+        },
+        className="ag-theme-alpine",
+        style={"height": "420px", "width": "100%"},
+    )
+
+    return grid
 
 # Table Options
 table_options = os.getenv("TABLE_OPTIONS").split(",")
@@ -237,10 +296,17 @@ dataset_layout = dcc.Tab(
             # Error message area
             html.Div(id="dataset-error-message", style={"color": "red", "marginTop": "20px", "fontWeight": "bold"})
         ]),
-        # Data table
+        # Data table (AG Grid will replace the non-interactive plot)
         html.Div(html.Div(id="dataset_container", style={"display": "none"}, children=[
-            html.Div(dcc.Graph(id="dataset", style={"marginBottom": "10px"}),
-                    style={"overflowX": "auto", "width": "100%"})
+            # AG Grid placeholder for interactive table view
+            html.Div(id="dataset_aggrid_container", style={"marginTop": "10px"}),
+            # Small toolbar to visualize selected rows
+            html.Div([
+                html.Button("Visualize selection", id="visualize_selection_btn", n_clicks=0,
+                            style={"backgroundColor": "#007bff", "color": "white", "border": "none", "borderRadius": "4px", "padding": "8px 12px", "cursor": "pointer"}),
+                html.Span(" "),
+                html.Span("(Select rows in table, then click Visualize selection)", style={"color": "#666", "marginLeft": "10px"})
+            ], style={"marginTop": "10px"})
         ]), style={"maxHeight": "800px", "overflowY": "auto", "backgroundColor": "#e5ecf6", "padding": "10px", "borderRadius": "5px", "border": "1px solid #d1d1d1"}),
         
         # Variable selectors for plotting
@@ -322,7 +388,7 @@ def set_tab_active(tab_value):
 def reset_tab_data(is_active):
     if not is_active:
         # Reset all controls when leaving the tab
-        return None, [], [], 20, None, None, [], {"display": "none"}, 0
+        return None, [], [],100, None, None, [], {"display": "none"}, 0
     else:
         # Don't reset when entering the tab
         return [dash.no_update] * 9
@@ -401,7 +467,7 @@ def update_row_count_info(selected_table):
         return "", 1000
 
 @callback(
-    [Output('dataset', 'figure'), Output('row_count_container', 'style'),
+    [Output('row_count_container', 'style'),
      Output('placeholder_message', 'style'), Output('dataset_container', 'style'),
      Output('variable_selector', 'style'), Output('generate_button_div', 'style'),
      Output('graph_type_explanation', 'style')],
@@ -411,22 +477,28 @@ def update_row_count_info(selected_table):
 def update_output(selected_table, selected_columns, row_count, column_options):
     no_display = {"display": "none"}
     if selected_table is None:
-        return {}, no_display, {"display": "block"}, no_display, no_display, no_display, no_display
+        # nothing selected: show placeholder, hide dataset container
+        return no_display, {"display": "block"}, no_display, no_display, no_display, no_display
+
+    # When a table is selected, show the dataset container (AG Grid will be rendered by update_aggrid)
+    if row_count is None:
+        row_count = 100
+    # ensure columns default
     if not selected_columns:
         cols = [opt['value'] for opt in column_options]
     else:
         cols = selected_columns
-    if row_count is None:
-        row_count = 20
+
+    # try to clamp row_count to available rows (best-effort)
     try:
         cnt_df = fetch_data_from_sql(f"SELECT COUNT(*) AS row_count FROM [dbo].[{selected_table}]")
         total = cnt_df.iloc[0]['row_count']
         row_count = min(row_count, total)
-    except:
+    except Exception:
         pass
-    table_index = table_options.index(selected_table)
-    fig_table = create_database_Table(table_index, cols, row_count)
-    return fig_table, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
+
+    # show dataset container, hide placeholder and display variable selector + generate options
+    return {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
 
 @callback(
     Output('generate_btn', 'disabled'),
@@ -481,6 +553,95 @@ def generate_figure(n_clicks, selected_table, x_var, y_var, row_count):
     graph1 = dcc.Graph(figure=fig_bar)
     graph2 = dcc.Graph(figure=fig_heat)
     return [graph1, graph2], {"display": "block"}
+
+
+# Populate the AG Grid for the selected dataset
+@callback(
+    Output('dataset_aggrid_container', 'children'),
+    [Input('dataset_dropdown', 'value'), Input('options', 'value'), Input('row_count', 'value')],
+    State('options', 'options'),
+    prevent_initial_call=True
+)
+def update_aggrid(selected_table, selected_columns, row_count, column_options):
+    if selected_table is None:
+        return []
+
+    if not selected_columns:
+        cols = [opt['value'] for opt in column_options]
+    else:
+        cols = selected_columns
+
+    if row_count is None:
+        row_count = 100
+
+    try:
+        cnt_df = fetch_data_from_sql(f"SELECT COUNT(*) AS row_count FROM [dbo].[{selected_table}]")
+        total = cnt_df.iloc[0]['row_count']
+        row_count = min(row_count, total)
+    except Exception:
+        pass
+
+    try:
+        query = f"SELECT TOP {row_count} {', '.join([f'[{c}]' for c in cols])} FROM [dbo].[{selected_table}]"
+        df = fetch_data_from_sql(query)
+        ag = build_ag_grid(df, grid_id="dataset-aggrid", page_size=50)
+        return ag
+    except Exception as e:
+        print(f"Error building AG Grid for dataset: {e}")
+        return html.Div(f"Error loading table: {e}")
+
+
+# Visualize selection: explicit button to build figures from AG Grid selection
+@callback(
+    [Output('figure_div', 'children', allow_duplicate=True), Output('figure_div', 'style', allow_duplicate=True)],
+    Input('visualize_selection_btn', 'n_clicks'),
+    State('dataset-aggrid', 'selectedRows'),
+    State('x_variable_dropdown', 'value'),
+    State('y_variable_dropdown', 'value'),
+    prevent_initial_call=True
+)
+def visualize_selection(n_clicks, selected_rows, x_var, y_var):
+    if n_clicks is None or n_clicks == 0:
+        return [], {"display": "none"}
+    if not selected_rows:
+        return html.Div("No rows selected. Select rows in the table and try again."), {"display": "block"}
+
+    try:
+        df = pd.DataFrame(selected_rows)
+    except Exception as e:
+        print(f"Error converting selected rows to DataFrame: {e}")
+        return html.Div(f"Error processing selection: {e}"), {"display": "block"}
+
+    # If x/y not provided, try to infer numeric columns
+    if x_var is None or y_var is None:
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if len(numeric_cols) >= 2:
+            x_var, y_var = numeric_cols[:2]
+        else:
+            return html.Div("Please select X and Y variables (or ensure selected rows contain numeric columns)."), {"display": "block"}
+
+    if x_var not in df.columns or y_var not in df.columns:
+        return html.Div("Selected variables are not present in the selected rows."), {"display": "block"}
+
+    num1, num2 = is_numeric_dtype(df[x_var]), is_numeric_dtype(df[y_var])
+
+    if num1 and num2:
+        fig = px.scatter(df, x=x_var, y=y_var, title=f"{y_var} vs {x_var} (selection)")
+        return dcc.Graph(figure=fig), {"display": "block"}
+
+    if num1 and not num2:
+        df_agg = df.groupby(y_var)[x_var].mean().reset_index()
+        fig = px.bar(df_agg, x=y_var, y=x_var, title=f"Mean {x_var} by {y_var} (selection)")
+        return dcc.Graph(figure=fig), {"display": "block"}
+
+    if num2 and not num1:
+        df_agg = df.groupby(x_var)[y_var].mean().reset_index()
+        fig = px.bar(df_agg, x=x_var, y=y_var, title=f"Mean {y_var} by {x_var} (selection)")
+        return dcc.Graph(figure=fig), {"display": "block"}
+
+    fig_bar = px.bar(df, x=x_var, color=y_var, barmode='group', title=f"{x_var} by {y_var} (selection)")
+    fig_heat = px.density_heatmap(df, x=x_var, y=y_var, title=f"Heatmap of {x_var} vs {y_var} (selection)")
+    return [dcc.Graph(figure=fig_bar), dcc.Graph(figure=fig_heat)], {"display": "block"}
 
 # Reset when tab is switched
 @callback(
