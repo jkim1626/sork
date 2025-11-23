@@ -27,6 +27,7 @@ joins_layout = dcc.Tab(
     children=[
         dcc.Store(id='joins-tab-active', data=False),
         dcc.Store(id='join-tab-full-data', data=None),  # Store full dataframe for filtering/sorting
+        dcc.Store(id='join-total-count', data=0),  # Store total count of rows
         html.Div(
             [
                 # Introduction section
@@ -159,7 +160,8 @@ joins_layout = dcc.Tab(
                                                        "borderRadius": "8px", "border": "1px solid #ffc107"}),
                 
                 # Join execution div - only shows after successful execution
-                html.Div([
+                dcc.Loading(children=[
+                    html.Div([
                     html.H4("Results", style={"marginBottom": "15px", "color": "#133817"}),
                     html.Div([
                         html.Strong("SQL Query:", style={"display": "block", "marginBottom": "5px"}),
@@ -172,43 +174,40 @@ joins_layout = dcc.Tab(
                                style={"color": "#666", "fontSize": "0.9em", "fontStyle": "italic", "marginBottom": "10px", 
                                       "padding": "10px", "backgroundColor": "#e7f3ff", "borderRadius": "5px"})
                     ]),
-                    dcc.Loading(
-                        html.Div([
-                            # DataTable in layout so callbacks can reference it
-                            dash_table.DataTable(
-                                id="join-tab-datatable",
-                                data=[],
-                                columns=[],
-                                page_size=25,
-                                page_action="native",
-                                filter_action="native",
-                                sort_action="native",
-                                sort_mode="multi",
-                                style_table={"overflowX": "auto"},
-                                style_cell={
-                                    "textAlign": "left",
-                                    "padding": "10px",
-                                    "fontSize": "12px",
-                                },
-                                style_header={
-                                    "backgroundColor": "#f0f0f0",
-                                    "fontWeight": "bold",
-                                    "textAlign": "center",
-                                },
-                                style_data={
-                                    "whiteSpace": "normal",
-                                    "height": "auto",
-                                },
-                                style_data_conditional=[
-                                    {
-                                        "if": {"row_index": "odd"},
-                                        "backgroundColor": "#f9f9f9",
-                                    }
-                                ],
-                            )
-                        ], id="join-tab-results-table"),
-                        type="circle"
-                    ),
+                    html.Div([
+                        # DataTable in layout so callbacks can reference it
+                        dash_table.DataTable(
+                            id="join-tab-datatable",
+                            data=[],
+                            columns=[],
+                            page_size=25,
+                            page_action="native",
+                            filter_action="native",
+                            sort_action="native",
+                            sort_mode="multi",
+                            style_table={"overflowX": "auto"},
+                            style_cell={
+                                "textAlign": "left",
+                                "padding": "10px",
+                                "fontSize": "12px",
+                            },
+                            style_header={
+                                "backgroundColor": "#f0f0f0",
+                                "fontWeight": "bold",
+                                "textAlign": "center",
+                            },
+                            style_data={
+                                "whiteSpace": "normal",
+                                "height": "auto",
+                            },
+                            style_data_conditional=[
+                                {
+                                    "if": {"row_index": "odd"},
+                                    "backgroundColor": "#f9f9f9",
+                                }
+                            ],
+                        )
+                    ], id="join-tab-results-table"),
                     html.Div([
                         html.Div(id="join-tab-results-stats", style={"marginTop": "15px", "color": "#666", "fontSize": "0.95em"}),
                         html.Div([
@@ -265,8 +264,10 @@ joins_layout = dcc.Tab(
                         dcc.Download(id="download-join-tab-csv"),
                         dcc.Download(id="download-join-tab-all-csv")
                     ])
+
                 ], id="join-tab-results-div", style={"display": "none", "padding": "20px", "backgroundColor": "#ffffff", 
                                                      "borderRadius": "8px", "border": "1px solid #e0e0e0"})
+            ], type="circle", color="#28a745", id="join-loading-outer")
             ]
         )
     ]
@@ -302,7 +303,9 @@ def set_tab_active(tab_value):
      Output('join-tab-full-data', 'data', allow_duplicate=True),
      Output('join-tab-datatable', 'data', allow_duplicate=True),
      Output('join-tab-datatable', 'columns', allow_duplicate=True),
-     Output('join-tab-csv-filename', 'value', allow_duplicate=True)],
+
+     Output('join-tab-csv-filename', 'value', allow_duplicate=True),
+     Output('join-total-count', 'data', allow_duplicate=True)],
     [Input('joins-tab-active', 'data')],
     prevent_initial_call=True
 )
@@ -312,10 +315,10 @@ def reset_tab_data(is_active):
         return (None, [], [], [], [], [], [], 
                 {"display": "none"}, {"display": "none"}, {"display": "none"}, 
                 {"display": "none"}, {"display": "none"}, {"display": "none"},
-                "", "", {"display": "none"}, "", None, [], [], "joined_data")
+                "", "", {"display": "none"}, "", None, [], [], "joined_data", 0)
     else:
         # Don't reset when entering the tab
-        return [dash.no_update] * 22
+        return [dash.no_update] * 23
 
 # Reset core table columns when core table changes
 @callback(
@@ -463,7 +466,7 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
     core_name = CORE_TABLES.get(core_table, core_table)
     core_count = len(core_vars) if core_vars else 0
     preview_parts.append(html.Div([
-        html.Strong(f"📊 {core_name}:"), 
+        html.Strong(f"{core_name}:"), 
         html.Span(f" {core_count} columns selected", style={"marginLeft": "10px"})
     ], style={"marginBottom": "8px"}))
     
@@ -471,7 +474,7 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
     if tree_vars:
         tree_count = len(tree_vars)
         preview_parts.append(html.Div([
-            html.Strong("🌳 Maternal Tree Climate:"), 
+            html.Strong("Maternal Tree Climate:"), 
             html.Span(f" {tree_count} columns selected", style={"marginLeft": "10px"}),
             html.Br(),
             html.Span("(Matched by Accession + Locality)", style={"fontSize": "0.85em", "color": "#888", "marginLeft": "20px"})
@@ -485,7 +488,7 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
         else:
             match_info = "(Matched by Year + Site)"
         preview_parts.append(html.Div([
-            html.Strong("🌱 Garden Climate:"), 
+            html.Strong("Garden Climate:"), 
             html.Span(f" {garden_count} columns selected", style={"marginLeft": "10px"}),
             html.Br(),
             html.Span(match_info, style={"fontSize": "0.85em", "color": "#888", "marginLeft": "20px"})
@@ -493,7 +496,7 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
     
     if not tree_vars and not garden_vars:
         preview_parts.append(html.Div([
-            html.Span("⚠️ Select at least one data source to combine", style={"color": "#ffc107", "fontStyle": "italic"})
+            html.Span("ERROR: Select at least one data source to combine", style={"color": "#ffc107", "fontStyle": "italic"})
         ]))
     
     return preview_parts, {"display": "block", "marginBottom": "20px", "padding": "15px", 
@@ -509,6 +512,9 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
         Output("join-tab-results-stats", "children", allow_duplicate=True),
         Output("join-tab-full-data", "data"),  # Store full dataframe
         Output("join-tab-csv-filename", "value", allow_duplicate=True),  # Set default filename
+        Output("download-join-tab-csv-button", "children", allow_duplicate=True),
+        Output("download-join-tab-all-csv-button", "children", allow_duplicate=True),
+        Output("join-total-count", "data"),
     ],
     [Input("join-tab-execute-button", "n_clicks")],
     [
@@ -521,7 +527,7 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
 )
 def execute_join(n_clicks, core_table, core_table_vars, maternal_tree_vars, garden_climate_vars):
     if not n_clicks or not core_table or (not maternal_tree_vars and not garden_climate_vars):
-        return {"display": "none"}, [], [], "", "", None, dash.no_update
+        return {"display": "none"}, [], [], "", "", None, dash.no_update, dash.no_update, dash.no_update, 0
 
     try:
         # 1) Required core columns
@@ -604,7 +610,7 @@ FROM [dbo].[{core_table}] core
 
         # 7) If nothing came back, hide and exit
         if result_df is None or result_df.empty:
-            return {"display": "none"}, [], [], sql_query, "", None, dash.no_update
+            return {"display": "none"}, [], [], sql_query, "", None, dash.no_update, dash.no_update, dash.no_update, 0
 
         # 8) Prepare data for the table with filtering and sorting enabled
         # Store full dataframe (limit to 10000 rows for performance in display)
@@ -615,8 +621,8 @@ FROM [dbo].[{core_table}] core
         table_columns = [{"name": c, "id": c} for c in display_df.columns]
         
         # Store column info for stats
-        column_info = f"{len(core_cols)} core columns | {len(safe_tree_vars)} maternal columns | {len(safe_garden_vars)} garden columns"
-        stats_text = f"✅ {len(result_df):,} total rows (showing up to 10,000) | {column_info}"
+        total_rows = len(result_df)
+        stats_text = f"Total Rows: {total_rows:,}"
 
         # Store full dataframe as JSON for later use
         full_data_json = result_df.to_dict("records")
@@ -624,12 +630,15 @@ FROM [dbo].[{core_table}] core
         # Generate default filename based on core table name
         default_filename = CORE_TABLES.get(core_table, "joined_data").lower().replace(" ", "_").replace("/", "_")
         
-        return {"display": "block"}, table_data, table_columns, sql_query, stats_text, full_data_json, default_filename
+        filtered_btn_text = f"Download Filtered Dataset ({len(result_df):,} rows)" #### ATTENTION, has a maximum of 10,000 rows, incorrect
+        full_btn_text = f"Download Full Dataset ({total_rows:,} rows)"
+
+        return {"display": "block"}, table_data, table_columns, sql_query, stats_text, full_data_json, default_filename, filtered_btn_text, full_btn_text, total_rows
 
     except Exception as e:
         err = f"Error executing join: {e}"
         print("SQL Error:", err)
-        return {"display": "none"}, [], [], err, "", None, dash.no_update
+        return {"display": "none"}, [], [], err, "", None, dash.no_update, dash.no_update, dash.no_update, 0
         
 # Reset results when any selection changes (but don't show error until execute is clicked)
 @callback(
@@ -645,31 +654,37 @@ def reset_results_on_selection_change(core_vars, tree_vars, garden_vars):
 
 # Update stats when filtering/sorting changes
 @callback(
-    Output("join-tab-results-stats", "children", allow_duplicate=True),
+    [Output("join-tab-results-stats", "children", allow_duplicate=True),
+     Output("download-join-tab-csv-button", "children", allow_duplicate=True),
+     Output("download-join-tab-all-csv-button", "children", allow_duplicate=True)],
     [Input("join-tab-datatable", "derived_virtual_data"),
-     Input("join-tab-full-data", "data")],
+     Input("join-total-count", "data")],
     prevent_initial_call=True
 )
-def update_filtered_stats(filtered_data, full_data):
+def update_filtered_stats(filtered_data, total_count):
     # Handle case where DataTable doesn't exist yet or data is missing
-    if filtered_data is None or full_data is None:
+    if filtered_data is None:
         return dash.no_update
     
     try:
-        filtered_count = len(filtered_data) if filtered_data else 0
-        total_count = len(full_data) if full_data else 0
+        filtered_count = len(filtered_data)
+        total_count = total_count if total_count else 0
         
-        if filtered_count == 0 or total_count == 0:
+        if total_count == 0:
             return dash.no_update
         
         # Extract column info from original stats format if available
         # For now, just show row counts - column info is less critical for filtered view
-        if filtered_count == total_count:
-            stats_text = f"✅ Showing all {total_count:,} rows"
+        if filtered_count >= total_count or filtered_count == 10000: # 10000 is the limit
+             stats_text = f"Showing all {total_count:,} rows"
+             filtered_btn_text = f"Download Filtered Dataset ({total_count:,} rows)"
         else:
-            stats_text = f"✅ Showing {filtered_count:,} of {total_count:,} rows (filtered/sorted)"
+             stats_text = f"Filtered down to {filtered_count:,} of {total_count:,} rows"
+             filtered_btn_text = f"Download Filtered Dataset ({filtered_count:,} rows)"
         
-        return stats_text
+        full_btn_text = f"Download Full Dataset ({total_count:,} rows)"
+        
+        return stats_text, filtered_btn_text, full_btn_text
     except Exception as e:
         print(f"Error updating stats: {e}")
         return dash.no_update
@@ -689,7 +704,15 @@ def download_filtered_join_results(n_clicks, filtered_data, full_data, custom_fi
     
     try:
         # Use filtered data if available, otherwise use full data
-        data_to_download = filtered_data if filtered_data else full_data
+        # If filtered data length matches the view limit (10000), assume it's unfiltered and use full data
+        view_limit = 10000
+        total_count = len(full_data) if full_data else 0
+        current_view_count = min(total_count, view_limit)
+        
+        if filtered_data and len(filtered_data) == current_view_count:
+            data_to_download = full_data
+        else:
+            data_to_download = filtered_data if filtered_data else full_data
         
         if not data_to_download:
             return dash.no_update
