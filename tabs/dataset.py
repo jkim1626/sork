@@ -244,8 +244,6 @@ dataset_layout = dcc.Tab(
                 # filter and selection counts
                 html.Span(id='filter_count_text', style={"marginRight": "20px", "fontWeight": "bold"}),
                 html.Span(id='selected_count_text', style={"fontWeight": "bold", "marginRight": "12px"}),
-                html.Button("Deselect All Rows", id="deselect_all_rows", n_clicks=0,
-                            style={"fontSize": "0.9em", "padding": "3px 8px", "backgroundColor": "#f0f0f0", "border": "1px solid #ccc", "borderRadius": "4px"})
             ], style={"marginBottom": "8px"}),
             html.Div(id="dataset_container", style={"display": "none"}, children=[
                 html.Div(
@@ -257,9 +255,10 @@ dataset_layout = dcc.Tab(
                             'filter': True,
                             'sortable': True,
                             'resizable': True,
-                            'minWidth': 20
+                            'minWidth': 50,
+                            'width': 120
                         },
-                        dashGridOptions={'rowSelection': 'multiple'},
+                        dashGridOptions={'rowSelection': 'multiple', 'rowMultiSelectWithClick': True},
                         selectedRows=[],
                         className='ag-theme-alpine',
                         style={'width': '100%', 'height': '400px'},
@@ -297,8 +296,13 @@ dataset_layout = dcc.Tab(
         ], id="graph_type_explanation", style={"display": "none", "marginBottom": "15px", "backgroundColor": "#f9f9f9", "padding": "10px", "borderRadius": "5px"}),
         
         # Generate figure button
-        html.Div(html.Button("Generate Figure", id="generate_btn", n_clicks=0, disabled=True),
-                id="generate_button_div", style={"display": "none", "textAlign": "center", "marginBottom": "15px"}),
+        html.Div([
+            html.Button("Generate Figure", id="generate_btn", n_clicks=0, disabled=False,
+                         style={"backgroundColor": "#007bff", "color": "white", "border": "1px solid #e0e0e0", "borderRadius": "8px", "padding": "3px 8px", "cursor": "pointer"}),
+            html.Span("", id="generate_info", style={"marginLeft": "10px", "fontWeight": "normal", "color": "#444"})
+        ], id="generate_button_div", style={"display": "none", "textAlign": "center", "marginBottom": "15px"}),
+        # Warning area for Generate actiond
+        html.Div(id='generate_warning', children="", style={"textAlign": "center", "marginBottom": "10px"}),
         # Figure output
         html.Div(id="figure_div", style={"display": "none"}, children=[
             dcc.Loading(dcc.Graph(id="figure_graph"), type="default")
@@ -476,14 +480,14 @@ def update_row_count_info(selected_table):
     [Output('dataset_grid', 'rowData'), Output('dataset_grid', 'columnDefs'), Output('row_count_container', 'style'),
      Output('placeholder_message', 'style'), Output('dataset_container', 'style'),
      Output('variable_selector', 'style'), Output('generate_button_div', 'style'),
-     Output('graph_type_explanation', 'style'), Output('deselect_all_rows', 'style')],
+     Output('graph_type_explanation', 'style')],
     [Input('dataset_dropdown', 'value'), Input('options', 'value'), Input('row_count', 'value')],
     State('options', 'options')
 )
 def update_output(selected_table, selected_columns, row_count, column_options):
     no_display = {"display": "none"}
     if selected_table is None:
-        return [], [], no_display, {"display": "block"}, no_display, no_display, no_display, no_display, {"display": "none"}
+        return [], [], no_display, {"display": "block"}, no_display, no_display, no_display, no_display
     if not selected_columns:
         cols = [opt['value'] for opt in column_options]
     else:
@@ -503,29 +507,64 @@ def update_output(selected_table, selected_columns, row_count, column_options):
         query = f"SELECT TOP {row_count} {cols_sql} FROM [dbo].[{selected_table}]"
         df = fetch_data_from_sql(query)
         row_data = df.to_dict('records')
-        column_defs = [{'headerName': c, 'field': c} for c in df.columns]
+
+        column_defs = []
+        # checkbox column pinned to left
+        column_defs.append({
+            'headerName': '',
+            'field': '__select__',
+            'checkboxSelection': True,
+            'headerCheckboxSelection': True,
+            'pinned': 'left',
+            'width': 50,
+            'sortable': False,
+            'filter': False
+        })
+
+        # choose an appropriate filter options based on column data type
+        for c in df.columns:
+            col_series = df[c]
+            is_num = False
+            # determine if column is numeric
+            try:
+                if is_numeric_dtype(col_series):
+                    is_num = True
+                else:
+                    # try coercing a small sample to detect numbers
+                    sample = pd.to_numeric(col_series.dropna().head(200), errors='coerce')
+                    if len(sample) > 0 and sample.notna().sum() / float(len(sample)) >= 0.5:
+                        is_num = True
+            except Exception:
+                is_num = False
+
+            if is_num:
+                col_def = {
+                    'headerName': c,
+                    'field': c,
+                    'filter': 'agNumberColumnFilter',
+                    'filterParams': {
+                        'filterOptions': ['equals', 'notEqual', 'lessThan', 'lessThanOrEqual', 'greaterThan', 'greaterThanOrEqual'],
+                        'suppressAndOrCondition': True
+                    }
+                }
+            else:
+                col_def = {
+                    'headerName': c,
+                    'field': c,
+                    'filter': 'agTextColumnFilter',
+                    'filterParams': {
+                        'filterOptions': ['contains','notContains','equals','notEqual','startsWith','endsWith'],
+                        'suppressAndOrCondition': True
+                    }
+                }
+
+            column_defs.append(col_def)
     except Exception as e:
         print(f"Error fetching table data for AgGrid: {e}")
         row_data, column_defs = [], []
 
-    return row_data, column_defs, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "inline-block"}
+    return row_data, column_defs, {"display": "block", "margin": "10px 0"}, {"display": "none"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}, {"display": "block"}, {"display": "block", "marginBottom": "15px"}
 
-@callback(
-    Output('generate_btn', 'disabled'),
-    Input('x_variable_dropdown', 'value'), Input('y_variable_dropdown', 'value')
-)
-def toggle_generate_button(x_var, y_var):
-    return not (x_var and y_var)
-
-@callback(
-    Output('dataset_grid', 'selectedRows'),
-    Input('deselect_all_rows', 'n_clicks'),
-    prevent_initial_call=True
-)
-def deselect_all_rows(n_clicks):
-    if not n_clicks or n_clicks == 0:
-        return dash.no_update
-    return []
 
 # Update filter and selection counts
 @callback(
@@ -548,9 +587,35 @@ def update_table_counts(row_data, selected_rows, filter_model):
 
     return f"Filtered rows: {filtered_count}", f"Selected rows: {selected_count}"
 
+
+# show how many rows will be used when generating the figure
+@callback(
+    Output('generate_info', 'children'),
+    [Input('dataset_grid', 'rowData'), Input('dataset_grid', 'selectedRows'), Input('dataset_grid', 'filterModel')],
+    [State('dataset_dropdown', 'value'), State('row_count', 'value')]
+)
+def update_generate_info(row_data, selected_rows, filter_model, selected_table, row_count):
+    # check box selected rows first
+    if selected_rows and len(selected_rows) > 0:
+        n = len(selected_rows)
+    # then filtered rows
+    elif row_data:
+        tmp = pd.DataFrame(row_data)
+        if filter_model:
+            tmp = apply_filter_model(tmp, filter_model)
+        n = len(tmp)
+    # then total rows from table
+    elif selected_table:
+        n = int(row_count) if row_count else 0
+    else:
+        n = 0
+
+    return f"(Generating figure using {n} rows of data)"
+
 @callback(
     [Output('figure_div', 'children', allow_duplicate=True), 
-     Output('figure_div', 'style', allow_duplicate=True)],
+     Output('figure_div', 'style', allow_duplicate=True),
+     Output('generate_warning', 'children', allow_duplicate=True)],
     Input('generate_btn', 'n_clicks'),
     State('dataset_dropdown', 'value'),
     State('x_variable_dropdown', 'value'),
@@ -560,8 +625,13 @@ def update_table_counts(row_data, selected_rows, filter_model):
     prevent_initial_call=True
 )
 def generate_figure(n_clicks, selected_table, x_var, y_var, row_count, row_data, selected_rows, filter_model):
-    if not n_clicks or n_clicks == 0 or selected_table is None or x_var is None or y_var is None:
-        return [], {"display": "none"}
+    # If no click or no table selected, clear any warning and do nothing
+    if not n_clicks or n_clicks == 0 or selected_table is None:
+        return [], {"display": "none"}, ""
+
+    # If variables are missing, show a user warning
+    if x_var is None or y_var is None:
+        return [], {"display": "none"}, "Warning: Please select an X and Y variable"
     
     # Generate different data frame if the joined one is stored
     col1, col2 = x_var, y_var
@@ -590,14 +660,14 @@ def generate_figure(n_clicks, selected_table, x_var, y_var, row_count, row_data,
             query = f"SELECT TOP {row_count} [{col1}], [{col2}] FROM [dbo].[{selected_table}]"
             df = fetch_data_from_sql(query)[[col1, col2]].dropna()
         else:
-            return [], {"display": "none"}
+            return [], {"display": "none"}, ""
     
     num1, num2 = is_numeric_dtype(df[col1]), is_numeric_dtype(df[col2])
     
     if num1 and num2:
         fig = px.scatter(df, x=col1, y=col2, title=f"{col1} vs {col2}")
         graph = dcc.Graph(figure=fig)
-        return graph, {"display": "block"}
+        return graph, {"display": "block"}, ""
     if num1 and not num2:
         num, cat = col1, col2
     elif num2 and not num1:
@@ -609,13 +679,13 @@ def generate_figure(n_clicks, selected_table, x_var, y_var, row_count, row_data,
         df_agg = df.groupby(cat)[num].mean().reset_index()
         fig = px.bar(df_agg, x=cat, y=num, title=f"Mean {num} by {cat}")
         graph = dcc.Graph(figure=fig)
-        return graph, {"display": "block"}
+        return graph, {"display": "block"}, ""
     
     fig_bar = px.bar(df, x=col1, color=col2, barmode='group', title=f"{col1} by {col2}")
     fig_heat = px.density_heatmap(df, x=col1, y=col2, title=f"Heatmap of {col1} vs {col2}")
     graph1 = dcc.Graph(figure=fig_bar)
     graph2 = dcc.Graph(figure=fig_heat)
-    return [graph1, graph2], {"display": "block"}
+    return [graph1, graph2], {"display": "block"}, ""
 
 # Reset when tab is switched
 @callback(
