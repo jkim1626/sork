@@ -5,12 +5,25 @@ import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
 import numpy as np
-from scipy import stats
+from scipy import stats as scipy_stats
 from database import fetch_data_from_sql
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from dotenv import load_dotenv
 import os
+from datetime import datetime
+
+# Import join utilities
+from tabs.joins import (
+    create_join_ui, 
+    CORE_TABLES, 
+    ALLOWED_CORE_TABLES,
+    MATERNAL_TREE_TABLE,
+    GARDENS_TABLE,
+    validate_table_name,
+    get_column_lists_cached,
+    generate_join_query
+)
 
 # Load environment variables
 load_dotenv(override=True)
@@ -50,14 +63,23 @@ stats_layout = dcc.Tab(
         # Store for table metadata (row counts, numeric columns)
         dcc.Store(id="stats-metadata-store", data={}),
         
+        # Store for join query and metadata
+        dcc.Store(id='stats-join-query-store'),
+        
         html.Br(),
         html.H4("Statistical Analysis", style={"marginBottom": "20px"}),
 
-        # Table selection
-        html.Label("1) Select a table", style={"fontWeight": "bold", "marginBottom": "5px", "fontSize": "16px"}), 
-        dcc.Dropdown(table_options, id="stats-table-dropdown", placeholder="Table Options"),
+        # Table selection (will include Custom Join option)
+        html.Label("1) Select a table or create custom join", style={"fontWeight": "bold", "marginBottom": "5px", "fontSize": "16px"}), 
+        dcc.Dropdown(id="stats-table-dropdown", placeholder="Select Table or Custom Join"),
         
-        # Test selection
+        # Join UI container (hidden initially, shown when Custom Join selected)
+        html.Div([
+            html.Br(),
+            create_join_ui("stats")
+        ], id="stats-join-ui-wrapper", style={"display": "none"}),
+        
+        # Test selection (hidden until table/join is ready)
         html.Div([
             html.Label("2) Select analysis type", style={"fontWeight": "bold", "marginTop": "20px", "marginBottom": "5px", "fontSize": "16px"}),
             dcc.Dropdown(stat_test_options, id="stats-test-dropdown", placeholder="Statistical Test Options"),
@@ -214,15 +236,15 @@ stats_layout = dcc.Tab(
 # ===== HELPERS =====
 
 # Validate table name against whitelist
-def validate_table_name(table_name):
-    if table_name not in ALLOWED_TABLES:
+def validate_table_name_stats(table_name):
+    if table_name not in ALLOWED_TABLES and table_name != "__custom_join__":
         raise ValueError(f"Invalid table name: {table_name}")
     return table_name
 
 # Get approximate row count using sys.partitions
 def get_table_row_count(table_name):
     try:
-        validate_table_name(table_name)
+        validate_table_name_stats(table_name)
         query = f"""
         SELECT SUM(p.rows) AS row_count
         FROM sys.partitions p
@@ -241,7 +263,7 @@ def get_table_row_count(table_name):
 # Get numeric column names from INFORMATION_SCHEMA
 def get_numeric_column_names(table_name):
     try:
-        validate_table_name(table_name)
+        validate_table_name_stats(table_name)
         query = f"""
         SELECT COLUMN_NAME, DATA_TYPE 
         FROM INFORMATION_SCHEMA.COLUMNS 
@@ -292,6 +314,85 @@ def format_sample_info(sample_size, total_rows):
 def set_stats_tab_active(tab_value):
     return tab_value == 'stats-tab'
 
+# Update dropdown options to include Custom Join
+@callback(
+    Output('stats-table-dropdown', 'options'),
+    Input('stats-tab-active', 'data'),
+    prevent_initial_call=False
+)
+def update_stats_table_options(is_active):
+    # Start with regular table options
+    options = [{'label': table, 'value': table} for table in table_options]
+    
+    # Add Custom Join option at the top
+    options.insert(0, {'label': '--- Custom Join ---', 'value': 'custom_join'})
+    
+    return options
+
+# Show/hide join UI and control test selection based on table selection
+@callback(
+    [Output('stats-join-ui-wrapper', 'style'),
+     Output('stats-join-ui-container', 'style'),
+     Output('test-selection-div', 'style', allow_duplicate=True),
+     Output('test-container', 'style', allow_duplicate=True),
+     Output('stats-placeholder', 'style', allow_duplicate=True)],
+    [Input('stats-table-dropdown', 'value')],
+    prevent_initial_call=True
+)
+def control_join_ui_visibility(selected_value):
+    if selected_value == 'custom_join':
+        # Show join UI, hide test selection and test container
+        return (
+            {"display": "block"},  # wrapper
+            {"display": "block"},  # join UI container
+            {"display": "none"},   # test selection
+            {"display": "none"},   # test container
+            {"display": "none"}    # placeholder
+        )
+    elif selected_value == "__custom_join__":
+        # Custom join executed - keep join UI visible AND show test selection
+        return (
+            {"display": "block"},  # wrapper - keep visible
+            {"display": "block"},  # join UI container - keep visible
+            {"display": "block"},  # test selection - now visible
+            {"display": "none"},   # test container
+            {"display": "none"}    # placeholder
+        )
+    elif selected_value is None:
+        # Nothing selected - show placeholder
+        return (
+            {"display": "none"},   # wrapper
+            {"display": "none"},   # join UI container
+            {"display": "none"},   # test selection
+            {"display": "none"},   # test container
+            {"display": "block"}   # placeholder
+        )
+    else:
+        # Regular table selected - hide join UI, show test selection
+        return (
+            {"display": "none"},   # wrapper
+            {"display": "none"},   # join UI container
+            {"display": "block"},  # test selection
+            {"display": "none"},   # test container
+            {"display": "none"}    # placeholder
+        )
+
+# Reset join UI when custom join is selected
+@callback(
+    [Output('stats-join-core-dropdown', 'value'),
+     Output('stats-join-core-table-options', 'value'),
+     Output('stats-join-tree-table-options', 'value'),
+     Output('stats-join-garden-table-options', 'value')],
+    [Input('stats-table-dropdown', 'value')],
+    prevent_initial_call=True
+)
+def reset_join_ui(selected_value):
+    if selected_value == 'custom_join':
+        # Reset to empty
+        return None, [], [], []
+    else:
+        raise PreventUpdate
+
 # Reset all components when tab is switched
 @callback(
     [Output('stats-table-dropdown', 'value', allow_duplicate=True),
@@ -312,21 +413,66 @@ def reset_stats_tab_data(is_active):
     # Reset all controls when leaving the tab
     return None, None, None, None, None, None, html.Div(), html.Div(), html.Div()
 
-# Fetch and cache table metadata when table is selected
+# Fetch and cache table metadata when table is selected (handles both regular tables and custom join)
 @callback(
     [Output('stats-metadata-store', 'data'),
-     Output('test-selection-div', 'style'),
-     Output('stats-placeholder', 'style')],
-    [Input('stats-table-dropdown', 'value')],
+     Output('test-selection-div', 'style', allow_duplicate=True),
+     Output('stats-placeholder', 'style', allow_duplicate=True)],
+    [Input('stats-table-dropdown', 'value'),
+     Input('stats-join-query-store', 'data')],
     [State('stats-metadata-store', 'data')],
     prevent_initial_call=True
 )
-def fetch_stats_metadata(selected_table, metadata_store):
+def fetch_stats_metadata(selected_table, join_query_data, metadata_store):
+    # Don't proceed if Custom Join selected (will be handled after execution)
+    if selected_table == 'custom_join':
+        raise PreventUpdate
+    
     if selected_table is None:
         return metadata_store, {"display": "none"}, {"display": "block"}
     
+    # Handle custom join
+    if selected_table == "__custom_join__":
+        if not join_query_data:
+            return metadata_store, {"display": "none"}, {"display": "block"}
+        
+        # Check if already cached
+        if "__custom_join__" in metadata_store:
+            return metadata_store, {"display": "block"}, {"display": "none"}
+        
+        # Fetch metadata for joined table
+        try:
+            total_rows = join_query_data.get('total_rows', 0)
+            
+            # Get numeric columns by fetching a sample
+            base_query = join_query_data.get('base_query')
+            sample_query = f"SELECT TOP 1 * FROM ({base_query}) AS sample"
+            sample_df = fetch_data_from_sql(sample_query)
+            
+            if sample_df is None or sample_df.empty:
+                return metadata_store, {"display": "none"}, {"display": "block"}
+            
+            # Detect numeric columns
+            numeric_columns = []
+            for col in sample_df.columns:
+                if pd.api.types.is_numeric_dtype(sample_df[col]):
+                    numeric_columns.append(col)
+            
+            # Store metadata
+            metadata_store["__custom_join__"] = {
+                'row_count': total_rows,
+                'numeric_columns': numeric_columns
+            }
+            
+            return metadata_store, {"display": "block"}, {"display": "none"}
+            
+        except Exception as e:
+            print(f"Error fetching custom join metadata: {e}")
+            return metadata_store, {"display": "none"}, {"display": "block"}
+    
+    # Handle regular tables
     try:
-        validate_table_name(selected_table)
+        validate_table_name_stats(selected_table)
         
         # Check if metadata already cached
         if selected_table in metadata_store:
@@ -361,25 +507,24 @@ def fetch_stats_metadata(selected_table, metadata_store):
      Output('summary-variable', 'value', allow_duplicate=True),
      Output('lr-output-content', 'children', allow_duplicate=True),
      Output('pca-output-content', 'children', allow_duplicate=True),
-     Output('summary-output-content', 'children', allow_duplicate=True),
-     Output('test-container', 'style')],
+     Output('summary-output-content', 'children', allow_duplicate=True)],
     [Input('stats-table-dropdown', 'value')],
     prevent_initial_call=True
 )
 def reset_on_table_change(selected_table):
     if selected_table:
         # Reset analysis-related controls but show test selection
-        return None, None, None, None, None, html.Div(), html.Div(), html.Div(), {"display": "none"}
+        return None, None, None, None, None, html.Div(), html.Div(), html.Div()
     else:
         # Hide everything when no table is selected
-        return None, None, None, None, None, html.Div(), html.Div(), html.Div(), {"display": "none"}
+        return None, None, None, None, None, html.Div(), html.Div(), html.Div()
 
 # Callback to show appropriate test container based on selection
 @callback(
     [Output("test-container", "style", allow_duplicate=True),
-     Output("linear-regression-div", "style"),
-     Output("pca-div", "style"),
-     Output("summary-stats-div", "style"),
+     Output("linear-regression-div", "style", allow_duplicate=True),
+     Output("pca-div", "style", allow_duplicate=True),
+     Output("summary-stats-div", "style", allow_duplicate=True),
      Output('lr-output-content', 'children', allow_duplicate=True),
      Output('pca-output-content', 'children', allow_duplicate=True),
      Output('summary-output-content', 'children', allow_duplicate=True)],
@@ -409,11 +554,14 @@ def show_test_container(selected_test):
      Input("stats-metadata-store", "data")]
 )
 def update_variable_options(selected_table, metadata_store):
-    if not selected_table or selected_table not in metadata_store:
+    # Handle custom join case
+    actual_table = "__custom_join__" if selected_table == 'custom_join' or selected_table == '__custom_join__' else selected_table
+    
+    if not actual_table or actual_table not in metadata_store:
         return [], [], [], []
     
     try:
-        numeric_cols = metadata_store[selected_table].get('numeric_columns', [])
+        numeric_cols = metadata_store[actual_table].get('numeric_columns', [])
         options = [{"label": col, "value": col} for col in numeric_cols]
         return options, options, options, options
     except Exception as e:
@@ -430,6 +578,262 @@ def clear_pca_warning(variables):
     """Clear warning when user changes variable selection."""
     return html.Div()
 
+
+# ===== JOIN-RELATED CALLBACKS (with stats- prefix) =====
+
+# Populate join column options when core table is selected
+@callback(
+    [Output("stats-join-core-table-options", "options"),
+     Output("stats-join-table-columns-container", "style"),
+     Output("stats-join-tree-table-options", "options"),
+     Output("stats-join-tree-table-columns-container", "style"),
+     Output("stats-join-garden-table-options", "options"),
+     Output("stats-join-garden-table-columns-container", "style"),
+     Output("stats-join-execute-button-div", "style"),
+     Output("stats-join-preview-container", "style"),
+     Output("stats-join-general-error", "children")],
+    [Input("stats-join-core-dropdown", "value")]
+)
+def update_join_column_options(selected_table):
+    if selected_table is None:
+        return [], {"display": "none"}, [], {"display": "none"}, [], {"display": "none"}, {"display": "none"}, {"display": "none"}, ""
+
+    try:
+        # Validate table name
+        validate_table_name(selected_table, ALLOWED_CORE_TABLES)
+        
+        # Get column data directly
+        column_data = get_column_lists_cached({})
+        
+        # Get columns from cache
+        gardens_cols = column_data.get('gardens_columns', [])
+        tree_cols = column_data.get('tree_columns', [])
+        
+        # Create options (default: none selected)
+        GARDENS_TABLE_OPTIONS = [{'label': c, 'value': c} for c in gardens_cols]
+        MATERNAL_TREE_OPTIONS = [{'label': c, 'value': c} for c in tree_cols]
+
+        # Fetch core table columns
+        sample_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
+        if sample_df is None or sample_df.empty:
+            error_msg = "Error: Could not fetch columns from selected table"
+            return [], {"display": "none"}, [], {"display": "none"}, [], {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg
+        
+        cols = sample_df.columns.tolist()
+        opts = [{'label': c, 'value': c} for c in cols]
+        
+        return (opts, {"display": "block", "marginBottom": "20px", "padding": "15px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, 
+                MATERNAL_TREE_OPTIONS, {"display": "block", "marginBottom": "20px", "padding": "15px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, 
+                GARDENS_TABLE_OPTIONS, {"display": "block", "marginBottom": "20px", "padding": "15px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, 
+                {"display": "block", "textAlign": "center", "marginTop": "20px", "marginBottom": "20px"},
+                {"display": "block", "marginBottom": "20px"},
+                "")
+    except ValueError as ve:
+        error_msg = f"Security Error: {str(ve)}"
+        return [], {"display": "none"}, [], {"display": "none"}, [], {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg
+    except Exception as e:
+        error_msg = f"Error fetching columns: {str(e)}"
+        return [], {"display": "none"}, [], {"display": "none"}, [], {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg
+
+# Select/Deselect All buttons for core table
+@callback(
+    Output('stats-join-core-table-options', 'value', allow_duplicate=True),
+    [Input('stats-join-select-all-btn', 'n_clicks'), 
+     Input('stats-join-deselect-all-btn', 'n_clicks')],
+    [State('stats-join-core-table-options', 'options')],
+    prevent_initial_call=True
+)
+def handle_core_select_buttons(select_all_clicks, deselect_all_clicks, current_options):
+    trigger_id = ctx.triggered_id if ctx.triggered_id else None
+
+    if trigger_id == 'stats-join-select-all-btn' and current_options:
+        return [opt['value'] for opt in current_options]
+    if trigger_id == 'stats-join-deselect-all-btn':
+        return []
+    
+    raise PreventUpdate
+
+# Select/Deselect All buttons for tree table
+@callback(
+    Output('stats-join-tree-table-options', 'value', allow_duplicate=True),
+    [Input('stats-join-select-all-btn-2', 'n_clicks'), 
+     Input('stats-join-deselect-all-btn-2', 'n_clicks')],
+    [State('stats-join-tree-table-options', 'options')],
+    prevent_initial_call=True
+)
+def handle_tree_select_buttons(select_all_clicks, deselect_all_clicks, current_options):
+    trigger_id = ctx.triggered_id if ctx.triggered_id else None
+
+    if trigger_id == 'stats-join-select-all-btn-2' and current_options:
+        return [opt['value'] for opt in current_options]
+    if trigger_id == 'stats-join-deselect-all-btn-2':
+        return []
+    
+    raise PreventUpdate
+
+# Select/Deselect All buttons for garden table
+@callback(
+    Output('stats-join-garden-table-options', 'value', allow_duplicate=True),
+    [Input('stats-join-select-all-btn-3', 'n_clicks'), 
+     Input('stats-join-deselect-all-btn-3', 'n_clicks')],
+    [State('stats-join-garden-table-options', 'options')],
+    prevent_initial_call=True
+)
+def handle_garden_select_buttons(select_all_clicks, deselect_all_clicks, current_options):
+    trigger_id = ctx.triggered_id if ctx.triggered_id else None
+
+    if trigger_id == 'stats-join-select-all-btn-3' and current_options:
+        return [opt['value'] for opt in current_options]
+    if trigger_id == 'stats-join-deselect-all-btn-3':
+        return []
+    
+    raise PreventUpdate
+
+# Update join preview content
+@callback(
+    Output("stats-join-preview", "children"),
+    [Input("stats-join-core-dropdown", "value"),
+     Input("stats-join-core-table-options", "value"),
+     Input("stats-join-tree-table-options", "value"),
+     Input("stats-join-garden-table-options", "value")],
+    prevent_initial_call=True
+)
+def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
+    if not core_table:
+        return ""
+    
+    preview_parts = []
+    
+    # Core table info
+    core_name = CORE_TABLES.get(core_table, core_table)
+    core_count = len(core_vars) if core_vars else 0
+    preview_parts.append(html.Div([
+        html.Strong(f"{core_name}:"), 
+        html.Span(f" {core_count} columns selected", style={"marginLeft": "10px"})
+    ], style={"marginBottom": "8px"}))
+    
+    # Maternal tree info
+    if tree_vars:
+        tree_count = len(tree_vars)
+        preview_parts.append(html.Div([
+            html.Strong("Maternal Tree Climate:"), 
+            html.Span(f" {tree_count} columns selected", style={"marginLeft": "10px"}),
+            html.Br(),
+            html.Span("(Matched by Accession + Locality)", style={"fontSize": "0.85em", "color": "#888", "marginLeft": "20px"})
+        ], style={"marginBottom": "8px"}))
+    
+    # Garden climate info
+    if garden_vars:
+        garden_count = len(garden_vars)
+        if core_table == "leaf_traits_2016":
+            match_info = "(Matched by Site)"
+        else:
+            match_info = "(Matched by Year + Site)"
+        preview_parts.append(html.Div([
+            html.Strong("Garden Climate:"), 
+            html.Span(f" {garden_count} columns selected", style={"marginLeft": "10px"}),
+            html.Br(),
+            html.Span(match_info, style={"fontSize": "0.85em", "color": "#888", "marginLeft": "20px"})
+        ], style={"marginBottom": "8px"}))
+    
+    if not tree_vars and not garden_vars:
+        preview_parts.append(html.Div([
+            html.Span("Please select at least one data source", style={"color": "#ffc107", "fontStyle": "italic"})
+        ]))
+    
+    return preview_parts
+
+# Execute join and keep config visible while showing analysis options
+@callback(
+    [Output('stats-join-query-store', 'data'),
+     Output('stats-table-dropdown', 'value', allow_duplicate=True),
+     Output('test-selection-div', 'style', allow_duplicate=True),
+     Output('stats-join-general-error', 'children', allow_duplicate=True),
+     Output('stats-join-execute-error', 'style')],
+    [Input('stats-join-execute-button', 'n_clicks')],
+    [State('stats-join-core-dropdown', 'value'),
+     State('stats-join-core-table-options', 'value'),
+     State('stats-join-tree-table-options', 'value'),
+     State('stats-join-garden-table-options', 'value')],
+    prevent_initial_call=True
+)
+def execute_stats_join(n_clicks, core_table, core_vars, tree_vars, garden_vars):
+    if not n_clicks or not core_table or (not tree_vars and not garden_vars):
+        # Show error if attempting to execute without data sources
+        if n_clicks and (not tree_vars and not garden_vars):
+            return dash.no_update, dash.no_update, dash.no_update, "", {"display": "block", "textAlign": "center", "marginTop": "20px", "padding": "15px", "backgroundColor": "#fff3cd", "borderRadius": "8px", "border": "1px solid #ffc107"}
+        raise PreventUpdate
+    
+    try:
+        # Generate SQL query
+        base_query = generate_join_query(core_table, core_vars, tree_vars, garden_vars)
+        
+        # Execute query to get total row count
+        count_query = f"SELECT COUNT(*) AS total_rows FROM ({base_query}) AS count_subquery"
+        count_result = fetch_data_from_sql(count_query)
+        
+        if count_result is None or count_result.empty:
+            return None, dash.no_update, dash.no_update, "Error: Could not determine row count", {"display": "none"}
+        
+        total_rows = int(count_result.iloc[0]['total_rows'])
+        
+        # Prepare query store data
+        query_data = {
+            'base_query': base_query,
+            'total_rows': total_rows
+        }
+        
+        # Change dropdown to "__custom_join__" and show test selection
+        return (query_data, "__custom_join__", 
+                {"display": "block"}, "", {"display": "none"})
+        
+    except Exception as e:
+        error_msg = f"Error executing join: {str(e)}"
+        print(error_msg)
+        return None, dash.no_update, dash.no_update, error_msg, {"display": "none"}
+
+# Show error when execute button clicked without data sources
+@callback(
+    Output('stats-join-execute-error', 'style', allow_duplicate=True),
+    [Input('stats-join-execute-button', 'n_clicks')],
+    [State('stats-join-tree-table-options', 'value'),
+     State('stats-join-garden-table-options', 'value')],
+    prevent_initial_call=True
+)
+def show_join_error(n_clicks, tree_vars, garden_vars):
+    if not n_clicks:
+        raise PreventUpdate
+    
+    if not tree_vars and not garden_vars:
+        return {"display": "block", "textAlign": "center", "marginTop": "20px",
+                "padding": "15px", "backgroundColor": "#fff3cd", 
+                "borderRadius": "8px", "border": "1px solid #ffc107"}
+    
+    return {"display": "none"}
+
+
+# ===== ANALYSIS CALLBACKS (handle both regular tables and __custom_join__) =====
+
+def fetch_data_for_analysis(selected_table, columns, row_count, join_query_data):
+    """Helper to fetch data for analysis - handles both regular tables and custom joins"""
+    try:
+        if selected_table == "__custom_join__":
+            if not join_query_data:
+                return None
+            base_query = join_query_data.get('base_query')
+            cols_sql = ", ".join([f"[{c}]" for c in columns])
+            query = f"SELECT TOP {row_count} {cols_sql} FROM ({base_query}) AS subquery WHERE " + " AND ".join([f"[{c}] IS NOT NULL" for c in columns])
+        else:
+            validate_table_name_stats(selected_table)
+            cols_sql = ", ".join([f"[{c}]" for c in columns])
+            where_clause = " AND ".join([f"[{c}] IS NOT NULL" for c in columns])
+            query = f"SELECT TOP {row_count} {cols_sql} FROM [dbo].[{selected_table}] WHERE {where_clause}"
+        
+        return fetch_data_from_sql(query)
+    except Exception as e:
+        print(f"Error fetching data for analysis: {e}")
+        return None
+
 # Linear Regression Callback
 @callback(
     [Output("lr-output-content", "children", allow_duplicate=True),
@@ -442,20 +846,22 @@ def clear_pca_warning(variables):
     [State("stats-table-dropdown", "value"),
      State("lr-x-variable", "value"),
      State("lr-y-variable", "value"),
-     State("stats-metadata-store", "data")],
+     State("stats-metadata-store", "data"),
+     State("stats-join-query-store", "data")],
     prevent_initial_call=True
 )
-def generate_linear_regression(n_clicks_sample, n_clicks_full, selected_table, x_var, y_var, metadata_store):
+def generate_linear_regression(n_clicks_sample, n_clicks_full, selected_table, x_var, y_var, metadata_store, join_query_data):
     trigger_id = ctx.triggered_id if ctx.triggered_id else None
     
     if not trigger_id or not selected_table or not x_var or not y_var:
         raise PreventUpdate
     
     try:
-        validate_table_name(selected_table)
+        # Handle custom join case
+        actual_table = "__custom_join__" if selected_table == "__custom_join__" else selected_table
         
         # Get metadata
-        metadata = metadata_store.get(selected_table, {})
+        metadata = metadata_store.get(actual_table, {})
         total_rows = metadata.get('row_count', DEFAULT_SAMPLE_SIZE)
         
         # Determine if full dataset requested
@@ -466,9 +872,8 @@ def generate_linear_regression(n_clicks_sample, n_clicks_full, selected_table, x
         else:
             sample_size = calculate_sample_size(total_rows)
         
-        # Fetch the data with limit
-        query = f"SELECT TOP {sample_size} [{x_var}], [{y_var}] FROM [dbo].[{selected_table}] WHERE [{x_var}] IS NOT NULL AND [{y_var}] IS NOT NULL"
-        df = fetch_data_from_sql(query)
+        # Fetch the data
+        df = fetch_data_for_analysis(actual_table, [x_var, y_var], sample_size, join_query_data)
         
         # Check if we have enough data
         if df is None or df.empty or len(df) < MIN_ROWS_FOR_REGRESSION:
@@ -482,7 +887,7 @@ def generate_linear_regression(n_clicks_sample, n_clicks_full, selected_table, x
         x = df[x_var].values
         y = df[y_var].values
         
-        slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+        slope, intercept, r_value, p_value, std_err = scipy_stats.linregress(x, y)
         
         # Generate prediction line
         x_range = np.linspace(min(x), max(x), 100)
@@ -619,10 +1024,11 @@ def generate_linear_regression(n_clicks_sample, n_clicks_full, selected_table, x
     [State("stats-table-dropdown", "value"),
      State("pca-variables", "value"),
      State("pca-dimensions", "value"),
-     State("stats-metadata-store", "data")], 
+     State("stats-metadata-store", "data"),
+     State("stats-join-query-store", "data")], 
     prevent_initial_call=True
 )
-def generate_pca(n_clicks_sample, n_clicks_full, selected_table, variables, dimensions, metadata_store):
+def generate_pca(n_clicks_sample, n_clicks_full, selected_table, variables, dimensions, metadata_store, join_query_data):
     trigger_id = ctx.triggered_id if ctx.triggered_id else None
     
     if not trigger_id or not selected_table:
@@ -645,10 +1051,11 @@ def generate_pca(n_clicks_sample, n_clicks_full, selected_table, variables, dime
         return html.Div(), "Generate PCA", {"display": "none"}, "🔄 Analyze Full Dataset", warning_msg
     
     try:
-        validate_table_name(selected_table)
+        # Handle custom join case
+        actual_table = "__custom_join__" if selected_table == "__custom_join__" else selected_table
         
         # Get metadata
-        metadata = metadata_store.get(selected_table, {})
+        metadata = metadata_store.get(actual_table, {})
         total_rows = metadata.get('row_count', DEFAULT_SAMPLE_SIZE)
         
         # Determine if full dataset requested
@@ -660,15 +1067,14 @@ def generate_pca(n_clicks_sample, n_clicks_full, selected_table, variables, dime
             sample_size = calculate_sample_size(total_rows)
         
         # Fetch the data
-        columns = ", ".join([f"[{var}]" for var in variables])
-        query = f"SELECT TOP {sample_size} {columns} FROM [dbo].[{selected_table}]"
-        df = fetch_data_from_sql(query)
+        df = fetch_data_for_analysis(actual_table, variables, sample_size, join_query_data)
         
         # Drop rows with NaN values
-        df = df.dropna()
+        if df is not None:
+            df = df.dropna()
         
         # Check if we have enough data
-        if len(df) < MIN_ROWS_FOR_PCA:
+        if df is None or len(df) < MIN_ROWS_FOR_PCA:
             error_msg = html.Div([
                 html.H5("Insufficient Data", style={"color": "red"}),
                 html.P("Not enough valid data points for PCA analysis.")
@@ -817,20 +1223,22 @@ def generate_pca(n_clicks_sample, n_clicks_full, selected_table, variables, dime
      Input("run-summary-full", "n_clicks")],
     [State("stats-table-dropdown", "value"),
      State("summary-variable", "value"),
-     State("stats-metadata-store", "data")],
+     State("stats-metadata-store", "data"),
+     State("stats-join-query-store", "data")],
     prevent_initial_call=True
 )
-def generate_summary_statistics(n_clicks_sample, n_clicks_full, selected_table, variable, metadata_store):
+def generate_summary_statistics(n_clicks_sample, n_clicks_full, selected_table, variable, metadata_store, join_query_data):
     trigger_id = ctx.triggered_id if ctx.triggered_id else None
     
     if not trigger_id or not selected_table or not variable:
         raise PreventUpdate
     
     try:
-        validate_table_name(selected_table)
+        # Handle custom join case
+        actual_table = "__custom_join__" if selected_table == "__custom_join__" else selected_table
         
         # Get metadata
-        metadata = metadata_store.get(selected_table, {})
+        metadata = metadata_store.get(actual_table, {})
         total_rows = metadata.get('row_count', DEFAULT_SAMPLE_SIZE)
         
         # Determine if full dataset requested
@@ -842,8 +1250,7 @@ def generate_summary_statistics(n_clicks_sample, n_clicks_full, selected_table, 
             sample_size = calculate_sample_size(total_rows)
         
         # Fetch the data
-        query = f"SELECT TOP {sample_size} [{variable}] FROM [dbo].[{selected_table}] WHERE [{variable}] IS NOT NULL"
-        df = fetch_data_from_sql(query)
+        df = fetch_data_for_analysis(actual_table, [variable], sample_size, join_query_data)
             
         # Check if we have enough data
         if df is None or len(df) < 1:

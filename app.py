@@ -5,7 +5,6 @@ from tabs.stats import stats_layout
 from tabs.upload import upload_layout
 from tabs.download import download_layout
 from tabs.map import map_layout
-from tabs.joins import joins_layout
 import os
 import secrets
 from dotenv import load_dotenv
@@ -145,7 +144,6 @@ def serve_layout():
                         map_layout,
                         dataset_layout,
                         stats_layout,
-                        joins_layout,
                         upload_layout,
                         download_layout,
                     ], className="mb-4") 
