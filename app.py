@@ -149,7 +149,7 @@ def serve_layout():
                         upload_layout,
                         download_layout,
                     ], className="mb-4") 
-                ], className="col-8 mx-auto", style={"minHeight": "calc(100vh - 200px)"})
+                ], className="col-10 mx-auto", style={"minHeight": "calc(100vh - 200px)"})
             ], style={"flex": "1 0 auto"}),
             
             # Footer that stays at the bottom

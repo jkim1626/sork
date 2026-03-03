@@ -9,6 +9,12 @@ from database import fetch_data_from_sql
 load_dotenv(override=True)
 map_table = os.getenv("MAP_TABLE")
 
+# User can filter trees by accession/sample ID - public querying data
+SEARCH_ID_COLUMNS = [
+    {'label': ' Accession', 'value': 'Accession'},
+    {'label': ' Sample ID', 'value': 'sample_id'},
+]
+
 UCLA_coordinates = {
     "latitude": 34.0682,
     "longitude": -118.4455
@@ -80,11 +86,8 @@ map_layout = dcc.Tab(
             html.H5("Search Trees by ID", style={"marginBottom": "12px"}),
             dcc.RadioItems(
                 id='search-id-type',
-                options=[
-                    {'label': ' Accession', 'value': 'Accession'},
-                    {'label': ' Sample ID', 'value': 'sample_id'},
-                ],
-                value='Accession',
+                options=SEARCH_ID_COLUMNS,
+                value=SEARCH_ID_COLUMNS[0]['value'],
                 inline=True,
                 style={"marginBottom": "10px"}
             ),
@@ -102,7 +105,7 @@ map_layout = dcc.Tab(
                 'border': 'none', 'borderRadius': '4px',
                 'padding': '6px 16px', 'marginRight': '8px', 'cursor': 'pointer'
             }),
-            html.Button('Clear', id='clear-search-btn', n_clicks=0, style={
+            html.Button('Clear Table', id='clear-search-btn', n_clicks=0, style={
                 'backgroundColor': '#e9ebe8', 'color': '#333',
                 'border': '1px solid #aaa', 'borderRadius': '4px',
                 'padding': '6px 16px', 'cursor': 'pointer',
