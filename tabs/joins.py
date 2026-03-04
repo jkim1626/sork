@@ -1,4 +1,4 @@
-from dash import dcc, html, Input, Output, State, callback, ctx
+from dash import dcc, html, Input, Output, State, callback, ctx, clientside_callback
 from dash.exceptions import PreventUpdate
 import dash
 from dotenv import load_dotenv
@@ -6,6 +6,25 @@ from database import fetch_data_from_sql
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from dash_ag_grid import AgGrid
+
+import plotly.graph_objects as go
+import plotly.express as px
+from scipy import stats
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+
+# Statistical test options
+MIN_ROWS_FOR_REGRESSION = 3
+MIN_ROWS_FOR_PCA = 3
+MIN_VARS_FOR_PCA = 2
+
+stat_test_options = [
+    {'label': 'Linear Regression', 'value': 'linear_regression'},
+    {'label': 'Principal Component Analysis (PCA)', 'value': 'pca'},
+    {'label': 'Summary Statistics', 'value': 'summary_stats'},
+    {'label': 'Plot Data (No Test)', 'value': 'plot_data'}
+]
 
 # Load environment variables
 load_dotenv(override=True)
@@ -32,15 +51,17 @@ ALLOWED_CORE_TABLES = set(CORE_TABLES.keys())
 
 # Create a layout for the joins tab
 joins_layout = dcc.Tab(
-    label="Table Joins",
+    label="Select and Filter",
     id="joins-tab",
     style={"padding": "15px"},
     children=[
         dcc.Store(id='joins-tab-active', data=False),
         dcc.Store(id='join-tab-full-query', data=None),  # Store the SQL query instead of data
         dcc.Store(id='joins-metadata-store', data={}),  # Cache metadata (column lists)
-        html.Div(
-            [
+        html.Div(className="d-flex w-100", id="join-split-container", style={"height": "85vh", "flexDirection": "row", "maxWidth": "98%", "margin": "0 auto", "padding": "0 20px"}, children=[
+            # LEFT COLUMN: Selection (Draggable)
+            html.Div(id="join-left-pane", style={"flex": "0 0 auto", "width": "25%", "minWidth": "15%", "maxWidth": "85%", "overflowX": "hidden", "overflowY": "auto", "paddingRight": "20px"}, children=[
+
                 # Introduction section
                 html.Div([
                     html.H4("Join Your Data", style={"marginBottom": "10px", "color": "#133817"}),
@@ -82,7 +103,7 @@ joins_layout = dcc.Tab(
                     ]),
                     dcc.Checklist(id="join-core-table-options", options=[], value=[], inline=False,
                                 labelStyle={"display": "block", "marginBottom": "5px", "padding": "3px"},
-                                style={"maxHeight": "250px", "overflowY": "auto", "padding": "10px", 
+                                style={"maxHeight": "400px", "overflowY": "auto", "padding": "10px", 
                                       "backgroundColor": "#f9f9f9", "borderRadius": "5px"}),
                 ], id="join-table-columns-container", style={"display": "none", "marginBottom": "20px", 
                                                               "padding": "15px", "backgroundColor": "#ffffff", 
@@ -105,7 +126,7 @@ joins_layout = dcc.Tab(
                     ]),
                     dcc.Checklist(id="join-tree-table-options", options=[], value=[], inline=False,
                                 labelStyle={"display": "block", "marginBottom": "5px", "padding": "3px"},
-                                style={"maxHeight": "250px", "overflowY": "auto", "padding": "10px", 
+                                style={"maxHeight": "400px", "overflowY": "auto", "padding": "10px", 
                                       "backgroundColor": "#f9f9f9", "borderRadius": "5px"}),
                 ], id="join-tree-table-columns-container", style={"display": "none", "marginBottom": "20px",
                                                                     "padding": "15px", "backgroundColor": "#ffffff", 
@@ -128,7 +149,7 @@ joins_layout = dcc.Tab(
                     ]),
                     dcc.Checklist(id="join-garden-table-options", options=[], value=[], inline=False,
                                 labelStyle={"display": "block", "marginBottom": "5px", "padding": "3px"},
-                                style={"maxHeight": "250px", "overflowY": "auto", "padding": "10px", 
+                                style={"maxHeight": "400px", "overflowY": "auto", "padding": "10px", 
                                       "backgroundColor": "#f9f9f9", "borderRadius": "5px"}),
                 ], id="join-garden-table-columns-container", style={"display": "none", "marginBottom": "20px",
                                                                      "padding": "15px", "backgroundColor": "#ffffff", 
@@ -162,6 +183,21 @@ joins_layout = dcc.Tab(
                         }
                     )
                 ], id="join-tab-execute-button-div", style={"display": "none", "textAlign": "center", "marginTop": "20px", "marginBottom": "20px"}),
+            ]), # END LEFT COLUMN
+
+            # FULL HEIGHT DRAGGABLE DIVIDER
+            html.Div(id="join-drag-divider", style={
+                "width": "6px", 
+                "cursor": "col-resize", 
+                "backgroundColor": "#f4f4f4", 
+                "borderLeft": "1px solid #ddd",
+                "borderRight": "1px solid #ddd",
+                "zIndex": 10,
+                "transition": "background-color 0.2s"
+            }),
+            
+            # RIGHT COLUMN: Results & Analysis
+            html.Div(id="join-right-pane", style={"flex": "1 1 auto", "overflowY": "auto", "paddingLeft": "20px", "width": 0}, children=[
 
                 # Row count input (similar to dataset.py) with debouncing
                 html.Div([
@@ -262,9 +298,162 @@ joins_layout = dcc.Tab(
                         dcc.Download(id="download-join-tab-csv"),
                         dcc.Download(id="download-join-tab-all-csv")
                     ])
-                ])
-            ]
-        )
+                ]),
+
+                # -------------------------------------------------------------
+                # Statistical Analysis Section (Appended to Joins Tab)
+                # -------------------------------------------------------------
+                html.Div([
+                    html.H4("Statistical Analysis on Resulting Data", style={"marginBottom": "20px"}),
+
+                    # Test selection (only shows when there's data)
+                    html.Div([
+                        html.Label("1) Select analysis type", style={"fontWeight": "bold", "marginTop": "20px", "marginBottom": "5px", "fontSize": "16px"}),
+                        dcc.Dropdown(stat_test_options, id="stats-test-dropdown", placeholder="Statistical Test Options"),
+                    ], id="test-selection-div", style={"display": "block"}),
+                    
+                    # Containers for each test type
+                    html.Div([
+                        # Linear Regression
+                        html.Div([
+                            html.Label("2) Select variables for Linear Regression", style={"fontWeight": "bold", "marginTop": "20px", "marginBottom": "5px"}),
+                            html.Div([
+                                html.Label("X-axis:", style={"marginRight": "10px"}),
+                                dcc.Dropdown(id="lr-x-variable", placeholder="Select x Variable"),
+                            ], style={"marginBottom": "10px"}),
+                            html.Div([
+                                html.Label("Y-axis:", style={"marginRight": "10px"}),
+                                dcc.Dropdown(id="lr-y-variable", placeholder="Select y Variable"),
+                            ], style={"marginBottom": "10px"}),
+                            html.Button("Generate Regression", id="run-lr-button", n_clicks=0,
+                                       style={
+                                           "backgroundColor": "#007bff",
+                                           "color": "white",
+                                           "border": "none",
+                                           "borderRadius": "4px",
+                                           "padding": "5px 15px",
+                                           "marginTop": "10px"
+                                       }),
+                            html.Div(id="lr-output", style={"marginTop": "20px"}, children=[
+                                dcc.Loading(id="lr-loading", type="default", children=html.Div(id="lr-output-content"))
+                            ])
+                        ], id="linear-regression-div", style={"display": "none"}),
+                        
+                        # PCA
+                        html.Div([
+                            html.Label("2) Select variables for PCA", style={"fontWeight": "bold", "marginTop": "20px", "marginBottom": "5px"}),
+                            html.Div([
+                                html.Label("Select numeric columns (minimum 2):", style={"marginRight": "10px"}),
+                                dcc.Dropdown(id="pca-variables", placeholder="Variables", multi=True),
+                            ], style={"marginBottom": "10px"}),
+                            html.Div([
+                                html.Label("Visualization:", style={"marginRight": "10px"}),
+                                dcc.RadioItems(
+                                    id='pca-dimensions',
+                                    options=[
+                                        {'label': '2D ', 'value': '2d'},
+                                        {'label': '3D ', 'value': '3d'}
+                                    ],
+                                    value='2d',
+                                    inline=True,
+                                    style={"marginBottom": "10px"}
+                                ),
+                            ]),
+                            html.Button("Generate PCA", id="run-pca-button", n_clicks=0,
+                                       style={
+                                           "backgroundColor": "#007bff",
+                                           "color": "white",
+                                           "border": "none",
+                                           "borderRadius": "4px",
+                                           "padding": "5px 15px",
+                                           "marginTop": "10px"
+                                       }),
+                            # Warning message for insufficient variables
+                            html.Div(id="pca-warning", style={"marginTop": "10px"}),
+                            html.Div(id="pca-output", style={"marginTop": "20px"}, children=[
+                                dcc.Loading(id="pca-loading", type="default", children=html.Div(id="pca-output-content"))
+                            ])
+                        ], id="pca-div", style={"display": "none"}),
+                        
+                        # Plot Data (No Test)
+                        html.Div([
+                            html.Label("2) Select variables for Plot", style={"fontWeight": "bold", "marginTop": "20px", "marginBottom": "5px"}),
+                            html.Div([
+                                html.Label("X-axis:", style={"marginRight": "10px"}),
+                                dcc.Dropdown(id="pd-x-variable", placeholder="Select x Variable"),
+                            ], style={"marginBottom": "10px"}),
+                            html.Div([
+                                html.Label("Y-axis:", style={"marginRight": "10px"}),
+                                dcc.Dropdown(id="pd-y-variable", placeholder="Select y Variable"),
+                            ], style={"marginBottom": "10px"}),
+                            html.Button("Generate Figure", id="run-pd-button", n_clicks=0,
+                                       style={
+                                           "backgroundColor": "#007bff",
+                                           "color": "white",
+                                           "border": "none",
+                                           "borderRadius": "4px",
+                                           "padding": "5px 15px",
+                                           "marginTop": "10px"
+                                       }),
+                            
+                            # Graph type selector (appears conditionally for CatxCat)
+                            html.Div([
+                                html.Div([
+                                    html.Span("Switch view:", style={"fontWeight": "500", "marginRight": "15px", "color": "#333"}),
+                                    dcc.RadioItems(
+                                        id='cat-cat-graph-type',
+                                        options=[
+                                            {'label': ' 📊 Bar Chart', 'value': 'bar'},
+                                            {'label': ' 🔥 Heatmap', 'value': 'heatmap'}
+                                        ],
+                                        value='bar',
+                                        inline=True,
+                                        labelStyle={"marginRight": "20px", "cursor": "pointer"},
+                                        inputStyle={"marginRight": "5px"}
+                                    ),
+                                ], style={
+                                    "display": "flex", 
+                                    "alignItems": "center", 
+                                    "justifyContent": "center",
+                                    "padding": "12px 20px",
+                                    "backgroundColor": "#f8f9fa",
+                                    "borderRadius": "8px",
+                                    "border": "1px solid #dee2e6",
+                                    "marginTop": "15px"
+                                }),
+                            ], id="graph-type-selector", style={"display": "none"}),
+                            
+                            html.Div(id="pd-output", style={"marginTop": "20px"}, children=[
+                                dcc.Loading(id="pd-loading", type="default", children=html.Div(id="pd-output-content"))
+                            ])
+                        ], id="plot-data-div", style={"display": "none"}),
+                        
+                        # Summary Statistics
+                        html.Div([
+                            html.Label("2) Select Variable for Summary Statistics", style={"fontWeight": "bold", "marginTop": "20px", "marginBottom": "5px"}),
+                            html.Div([
+                                dcc.Dropdown(id="summary-variable", placeholder="Variables"),
+                            ], style={"marginBottom": "10px"}),
+                            html.Button("Generate Summary", id="run-summary-button", n_clicks=0,
+                                       style={
+                                           "backgroundColor": "#007bff",
+                                           "color": "white",
+                                           "border": "none",
+                                           "borderRadius": "4px",
+                                           "padding": "5px 15px",
+                                           "marginTop": "10px"
+                                       }),
+                            html.Div(id="summary-output", style={"marginTop": "20px"}, children=[
+                                dcc.Loading(id="summary-loading", type="default", children=html.Div(id="summary-output-content"))
+                            ])
+                        ], id="summary-stats-div", style={"display": "none"}),
+                        
+                    ], id="test-container", style={"display": "none"}),
+                    
+                ], id="stats-main-container", style={"display": "none", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0", "marginTop": "20px"})
+
+            ]) # END RIGHT COLUMN
+        ]) # END ROW
     ]
 ) 
 
@@ -468,10 +657,10 @@ def update_core_table_columns(selected_table, metadata_store):
         
         # Create options
         GARDENS_TABLE_OPTIONS = [{'label': c, 'value': c} for c in gardens_cols]
-        gardens_default_values = gardens_cols  # Auto-select all
+        gardens_default_values = []  # Empty by default
         
         MATERNAL_TREE_OPTIONS = [{'label': c, 'value': c} for c in tree_cols]
-        tree_default_values = tree_cols  # Auto-select all
+        tree_default_values = []  # Empty by default
 
         # Fetch core table columns (not cached since it depends on selection)
         sample_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
@@ -481,7 +670,7 @@ def update_core_table_columns(selected_table, metadata_store):
         
         cols = sample_df.columns.tolist()
         opts = [{'label': c, 'value': c} for c in cols]
-        core_default_values = cols  # Auto-select all
+        core_default_values = []  # Empty by default
         
         return (opts, core_default_values, {"display": "block", "marginBottom": "20px", 
                                             "padding": "15px", "backgroundColor": "#ffffff", 
@@ -1081,3 +1270,460 @@ def show_error_message(n_clicks, core_table_vars, maternal_tree_vars, garden_cli
                 "borderRadius": "8px", "border": "1px solid #ffc107"}
     
     return {"display": "none"}
+
+# ====== STATISTICAL CALLBACKS ======
+
+@callback(
+    [Output("stats-main-container", "style", allow_duplicate=True),
+     Output("lr-x-variable", "options"),
+     Output("lr-y-variable", "options"),
+     Output("pca-variables", "options"),
+     Output("summary-variable", "options"),
+     Output("pd-x-variable", "options"),
+     Output("pd-y-variable", "options"),
+     Output("stats-test-dropdown", "value"),
+     Output("lr-x-variable", "value"),
+     Output("lr-y-variable", "value"),
+     Output("pca-variables", "value"),
+     Output("summary-variable", "value"),
+     Output("pd-x-variable", "value"),
+     Output("pd-y-variable", "value"),
+     Output("lr-output-content", "children", allow_duplicate=True),
+     Output("pca-output-content", "children", allow_duplicate=True),
+     Output("summary-output-content", "children", allow_duplicate=True),
+     Output("pd-output-content", "children", allow_duplicate=True)],
+    [Input('join-tab-grid', 'rowData')],
+    prevent_initial_call=True
+)
+def populate_stats_options(row_data):
+    # This runs when grid row data is first loaded/updated. Let's provide options based on numeric columns in row_data.
+    if not row_data:
+        return {"display": "none"}, [], [], [], [], [], [], None, None, None, None, None, None, None, html.Div(), html.Div(), html.Div(), html.Div()
+    
+    df = pd.DataFrame(row_data)
+    numeric_cols = []
+    
+    all_options = []
+    for c in df.columns:
+        if c == '__select__':
+            continue
+        all_options.append({"label": c, "value": c})
+        col_series = df[c]
+        try:
+            if is_numeric_dtype(col_series):
+                numeric_cols.append(c)
+            else:
+                sample = pd.to_numeric(col_series.dropna().head(TYPE_DETECTION_SAMPLE_SIZE), errors='coerce')
+                if len(sample) > 0 and sample.notna().sum() / float(len(sample)) >= NUMERIC_THRESHOLD:
+                    numeric_cols.append(c)
+        except Exception:
+            pass
+            
+    options = [{"label": col, "value": col} for col in numeric_cols]
+    
+    # We also clear out previous results and selections to easily support new joins
+    return (
+        {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0", "marginTop": "20px"},
+        options, options, options, options, all_options, all_options,
+        None, None, None, None, None, None, None,
+        html.Div(), html.Div(), html.Div(), html.Div()
+    )
+
+@callback(
+    [Output("test-container", "style", allow_duplicate=True),
+     Output("linear-regression-div", "style"),
+     Output("pca-div", "style"),
+     Output("summary-stats-div", "style"),
+     Output("plot-data-div", "style"),
+     Output('lr-output-content', 'children', allow_duplicate=True),
+     Output('pca-output-content', 'children', allow_duplicate=True),
+     Output('summary-output-content', 'children', allow_duplicate=True),
+     Output('pd-output-content', 'children', allow_duplicate=True)],
+    [Input("stats-test-dropdown", "value")],
+    prevent_initial_call=True
+)
+def show_test_container(selected_test):
+    empty_output = html.Div()
+    if not selected_test:
+        return {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, empty_output, empty_output, empty_output, empty_output
+    
+    lr_style = {"display": "block"} if selected_test == "linear_regression" else {"display": "none"}
+    pca_style = {"display": "block"} if selected_test == "pca" else {"display": "none"}
+    summary_style = {"display": "block"} if selected_test == "summary_stats" else {"display": "none"}
+    plot_data_style = {"display": "block"} if selected_test == "plot_data" else {"display": "none"}
+    
+    return {"display": "block"}, lr_style, pca_style, summary_style, plot_data_style, empty_output, empty_output, empty_output, empty_output
+
+@callback(
+    Output("pca-warning", "children", allow_duplicate=True),
+    [Input("pca-variables", "value")],
+    prevent_initial_call=True
+)
+def clear_pca_warning(variables):
+    return html.Div()
+
+# Analysis Helper
+def get_analysis_df(base_query, filter_model):
+    query = f"SELECT TOP 50000 * FROM ({base_query}) q"
+    df = fetch_data_from_sql(query)
+    if df is not None and not df.empty and filter_model:
+        df = apply_filter_model(df, filter_model)
+    return df
+
+@callback(
+    Output("lr-output-content", "children", allow_duplicate=True),
+    [Input("run-lr-button", "n_clicks")],
+    [State("join-tab-full-query", "data"),
+     State("join-tab-grid", "filterModel"),
+     State("lr-x-variable", "value"),
+     State("lr-y-variable", "value")],
+    prevent_initial_call=True
+)
+def run_linear_regression(n_clicks, base_query, filter_model, x_var, y_var):
+    if not base_query or not x_var or not y_var:
+        raise PreventUpdate
+        
+    df = get_analysis_df(base_query, filter_model)
+    df = df.dropna(subset=[x_var, y_var])
+    
+    # Needs numeric conversion just in case
+    df[x_var] = pd.to_numeric(df[x_var], errors='coerce')
+    df[y_var] = pd.to_numeric(df[y_var], errors='coerce')
+    df = df.dropna(subset=[x_var, y_var])
+    
+    if df is None or df.empty or len(df) < MIN_ROWS_FOR_REGRESSION:
+        return html.Div([
+            html.H5("Insufficient Data", style={"color": "red"}),
+            html.P("Not enough valid data points for regression analysis.")
+        ], style={"color": "red", "fontWeight": "bold"})
+        
+    x = df[x_var].values
+    y = df[y_var].values
+    
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+    x_range = np.linspace(min(x), max(x), 100)
+    y_pred = slope * x_range + intercept
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=y, mode='markers', name='Data Points', marker=dict(color='blue', opacity=0.6, size=8)))
+    fig.add_trace(go.Scatter(x=x_range, y=y_pred, mode='lines', name='Regression Line', line=dict(color='red', width=2)))
+    
+    r_squared = r_value**2
+    equation = f"y = {slope:.4f}x + {intercept:.4f}"
+    
+    fig.update_layout(
+        title=f"Linear Regression: {y_var} vs {x_var}", xaxis_title=x_var, yaxis_title=y_var,
+        height=500, paper_bgcolor="#e5ecf6", plot_bgcolor="#f9f9f9",
+        annotations=[
+            dict(x=0.02, y=0.98, xref="paper", yref="paper", text=f"Equation: {equation}<br>R² = {r_squared:.4f}<br>p-value = {p_value:.4f}",
+                 showarrow=False, bgcolor="rgba(255, 255, 255, 0.8)", bordercolor="rgba(0, 0, 0, 0.2)", borderwidth=1, borderpad=10, font=dict(size=12))
+        ]
+    )
+    
+    # We replace HTML table with plotly figure table (so they can download as image)
+    table_fig = go.Figure(data=[go.Table(
+        header=dict(values=['Metric', 'Value'], align='left', line_color='darkslategray', fill_color='lightskyblue'),
+        cells=dict(values=[
+            ['Slope', 'Intercept', 'R-squared', 'p-value', 'Standard Error', 'Sample Size'], 
+            [f"{slope:.6f}", f"{intercept:.6f}", f"{r_squared:.6f}", f"{p_value:.6f}", f"{std_err:.6f}", str(len(df))]
+        ], align='left', line_color='darkslategray', fill_color='white')
+    )])
+    
+    table_fig.update_layout(
+        title="Regression Statistics",
+        height=250, margin=dict(t=50, b=0, l=0, r=0), paper_bgcolor="#ffffff", plot_bgcolor="#ffffff"
+    )
+
+    return html.Div([
+        dcc.Graph(figure=fig),
+        dcc.Graph(figure=table_fig)
+    ], style={"padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"})
+
+
+@callback(
+    Output("pca-output-content", "children", allow_duplicate=True),
+    [Input("run-pca-button", "n_clicks")],
+    [State("join-tab-full-query", "data"),
+     State("join-tab-grid", "filterModel"),
+     State("pca-variables", "value"),
+     State("pca-dimensions", "value")], 
+    prevent_initial_call=True
+)
+def run_pca(n_clicks, base_query, filter_model, variables, dimensions):
+    if not base_query or not variables:
+        raise PreventUpdate
+        
+    df = get_analysis_df(base_query, filter_model)
+    df = df.dropna(subset=variables)
+    
+    for v in variables:
+        df[v] = pd.to_numeric(df[v], errors='coerce')
+        
+    df = df.dropna(subset=variables)
+    
+    if df is None or df.empty or len(df) < MIN_ROWS_FOR_PCA:
+        return html.Div([
+            html.H5("Insufficient Data", style={"color": "red"}),
+            html.P("Not enough valid data points for PCA analysis.")
+        ], style={"color": "red", "fontWeight": "bold"})
+        
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(df[variables])
+    
+    n_components = min(3, len(variables))
+    pca = PCA(n_components=n_components)
+    pca_result = pca.fit_transform(scaled_data)
+    
+    pca_df = pd.DataFrame(data=pca_result, columns=[f'PC{i+1}' for i in range(n_components)])
+    explained_variance = pca.explained_variance_ratio_ * 100
+    
+    if dimensions == '3d' and n_components >= 3:
+        fig = px.scatter_3d(pca_df, x='PC1', y='PC2', z='PC3', title="3D PCA Visualization",
+            labels={'PC1': f'PC1 ({explained_variance[0]:.2f}%)', 'PC2': f'PC2 ({explained_variance[1]:.2f}%)', 'PC3': f'PC3 ({explained_variance[2]:.2f}%)'}, opacity=0.7)
+    else:
+        fig = px.scatter(pca_df, x='PC1', y='PC2', title="2D PCA Visualization",
+            labels={'PC1': f'PC1 ({explained_variance[0]:.2f}%)', 'PC2': f'PC2 ({explained_variance[1]:.2f}%)'}, opacity=0.7)
+            
+    fig.update_layout(height=600, paper_bgcolor="#e5ecf6", plot_bgcolor="#f9f9f9")
+    
+    loadings = pca.components_
+    loading_df = pd.DataFrame(loadings.T, columns=[f'PC{i+1}' for i in range(n_components)], index=variables)
+
+    # Explained Variance Table as Plotly Figure
+    ev_headers = ["Component", "Variance Explained (%)", "Cumulative Variance (%)"]
+    ev_components = [f"PC{i+1}" for i in range(n_components)]
+    ev_var = [f"{explained_variance[i]:.2f}%" for i in range(n_components)]
+    ev_cum = [f"{np.sum(explained_variance[:i+1]):.2f}%" for i in range(n_components)]
+    
+    ev_table_fig = go.Figure(data=[go.Table(
+        header=dict(values=ev_headers, align='left', line_color='darkslategray', fill_color='lightskyblue'),
+        cells=dict(values=[ev_components, ev_var, ev_cum], align='left', line_color='darkslategray', fill_color='white')
+    )])
+    ev_table_fig.update_layout(title="Explained Variance", height=200, margin=dict(t=50, b=0, l=0, r=0), paper_bgcolor="#ffffff", plot_bgcolor="#ffffff")
+
+    # Loadings Table as Plotly Figure
+    loadings_headers = ["Variable"] + [f"PC{i+1}" for i in range(n_components)]
+    loadings_values = [variables] + [[f"{loading_df.loc[var, f'PC{i+1}']:.4f}" for var in variables] for i in range(n_components)]
+    
+    load_table_fig = go.Figure(data=[go.Table(
+        header=dict(values=loadings_headers, align='left', line_color='darkslategray', fill_color='lightskyblue'),
+        cells=dict(values=loadings_values, align='left', line_color='darkslategray', fill_color='white')
+    )])
+    load_table_fig.update_layout(title="Variable Loadings", height=300, margin=dict(t=50, b=0, l=0, r=0), paper_bgcolor="#ffffff", plot_bgcolor="#ffffff")
+    
+    return html.Div([
+        dcc.Graph(figure=fig),
+        dcc.Graph(figure=ev_table_fig),
+        dcc.Graph(figure=load_table_fig)
+    ], style={"padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"})
+
+@callback(
+    Output("summary-output-content", "children", allow_duplicate=True),
+    [Input("run-summary-button", "n_clicks")],
+    [State("join-tab-full-query", "data"),
+     State("join-tab-grid", "filterModel"),
+     State("summary-variable", "value")],
+    prevent_initial_call=True
+)
+def run_summary(n_clicks, base_query, filter_model, variable):
+    if not base_query or not variable:
+        raise PreventUpdate
+        
+    df = get_analysis_df(base_query, filter_model)
+    
+    df[variable] = pd.to_numeric(df[variable], errors='coerce')
+    clean_data = df[variable].dropna()
+    
+    if len(clean_data) < 2:
+        return html.Div([
+            html.H5("Insufficient Data", style={"color": "red"}),
+            html.P("Not enough valid data points for summary statistics.")
+        ], style={"color": "red", "fontWeight": "bold"})
+        
+    mean = clean_data.mean()
+    median = clean_data.median()
+    std_dev = clean_data.std()
+    variance = clean_data.var()
+    minimum = clean_data.min()
+    maximum = clean_data.max()
+    q1 = clean_data.quantile(0.25)
+    q3 = clean_data.quantile(0.75)
+    skewness = stats.skew(clean_data)
+    kurtosis = stats.kurtosis(clean_data)
+    count = len(clean_data)
+    missing = len(df) - count
+    
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=clean_data, nbinsx=30, name='Histogram', marker_color='#007bff', opacity=0.7))
+    fig.add_vline(x=mean, line_dash="dash", line_color="red", annotation_text=f"Mean: {mean:.2f}", annotation_position="top right")
+    fig.add_vline(x=median, line_dash="dash", line_color="green", annotation_text=f"Median: {median:.2f}", annotation_position="top left")
+    
+    fig.update_layout(title=f"Distribution of {variable}", xaxis_title=variable, yaxis_title="Frequency", height=500, paper_bgcolor="#e5ecf6", plot_bgcolor="#f9f9f9")
+    
+    # Use Plotly Table for Summary Stats
+    sum_table_fig = go.Figure(data=[go.Table(
+        header=dict(values=['Statistic', 'Value'], align='left', line_color='darkslategray', fill_color='lightskyblue'),
+        cells=dict(values=[
+            ['Count', 'Missing Values', 'Mean', 'Median', 'Standard Deviation', 'Variance', 'Minimum', '25th Percentile (Q1)', '75th Percentile (Q3)', 'Maximum', 'Skewness', 'Kurtosis'],
+            [f"{count}", f"{missing}", f"{mean:.4f}", f"{median:.4f}", f"{std_dev:.4f}", f"{variance:.4f}", f"{minimum:.4f}", f"{q1:.4f}", f"{q3:.4f}", f"{maximum:.4f}", f"{skewness:.4f}", f"{kurtosis:.4f}"]
+        ], align='left', line_color='darkslategray', fill_color='white')
+    )])
+    sum_table_fig.update_layout(title="Summary Statistics", height=350, margin=dict(t=50, b=0, l=0, r=0), paper_bgcolor="#ffffff", plot_bgcolor="#ffffff")
+
+    # Add Box Plot
+    box_fig = go.Figure()
+    box_fig.add_trace(go.Box(x=clean_data, name=variable, marker_color='#28a745'))
+    box_fig.update_layout(title=f"Box Plot of {variable}", xaxis_title=variable, height=300, paper_bgcolor="#e5ecf6", plot_bgcolor="#f9f9f9")
+    
+    return html.Div([
+        dcc.Graph(figure=fig),
+        dcc.Graph(figure=box_fig),
+        dcc.Graph(figure=sum_table_fig)
+    ], style={"padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"})
+
+
+@callback(
+    [Output("pd-output-content", "children", allow_duplicate=True),
+     Output('graph-type-selector', 'style', allow_duplicate=True)],
+    [Input("run-pd-button", "n_clicks"),
+     Input('cat-cat-graph-type', 'value')],
+    [State('join-tab-full-query', 'data'),
+     State('join-tab-grid', 'rowData'),
+     State('join-tab-grid', 'selectedRows'),
+     State('join-tab-grid', 'filterModel'),
+     State('pd-x-variable', 'value'),
+     State('pd-y-variable', 'value')],
+    prevent_initial_call=True
+)
+def run_plot_data(n_clicks, graph_type, base_query, row_data, selected_rows, filter_model, x_var, y_var):
+    trigger_id = ctx.triggered_id if ctx.triggered_id else None
+    if trigger_id != 'run-pd-button' and trigger_id != 'cat-cat-graph-type':
+        raise PreventUpdate
+        
+    if not base_query or not x_var or not y_var:
+        raise PreventUpdate
+        
+    # Priority 1: Use user-selected rows if any
+    if selected_rows and len(selected_rows) > 0:
+        df = pd.DataFrame(selected_rows)
+    # Priority 2: Apply filter model to grid data if filters exist
+    elif row_data and filter_model:
+        df = pd.DataFrame(row_data)
+        df = apply_filter_model(df, filter_model)
+    # Priority 3: Use all grid data
+    elif row_data:
+        df = pd.DataFrame(row_data)
+    else:
+        df = get_analysis_df(base_query, filter_model)
+    
+    if df is None or df.empty:
+        return html.Div([
+            html.H5("Insufficient Data", style={"color": "red"}),
+            html.P("No valid data points for plotting.")
+        ], style={"color": "red", "fontWeight": "bold"}), {"display": "none"}
+        
+    df = df.dropna(subset=[x_var, y_var])
+    
+    if len(df) == 0:
+        return html.Div([
+            html.H5("Insufficient Data", style={"color": "red"}),
+            html.P("No valid data points after dropping missing values.")
+        ], style={"color": "red", "fontWeight": "bold"}), {"display": "none"}
+        
+    x_is_numeric = False
+    y_is_numeric = False
+    
+    try:
+        df[x_var] = pd.to_numeric(df[x_var])
+        x_is_numeric = True
+    except: pass
+
+    try:
+        df[y_var] = pd.to_numeric(df[y_var])
+        y_is_numeric = True
+    except: pass
+    
+    both_categorical = not x_is_numeric and not y_is_numeric
+    
+    if x_is_numeric and y_is_numeric:
+        fig = px.scatter(df, x=x_var, y=y_var, title=f"{x_var} vs {y_var}")
+    elif x_is_numeric or y_is_numeric:
+        numeric_var = x_var if x_is_numeric else y_var
+        categorical_var = y_var if x_is_numeric else x_var
+        df_agg = df.groupby(categorical_var)[numeric_var].mean().reset_index()
+        fig = px.bar(df_agg, x=categorical_var, y=numeric_var, title=f"Mean {numeric_var} by {categorical_var}")
+    else:
+        if graph_type == 'heatmap':
+            fig = px.density_heatmap(df, x=x_var, y=y_var, title=f"Heatmap of {x_var} vs {y_var}")
+        else:
+            fig = px.bar(df, x=x_var, color=y_var, barmode='group', title=f"{x_var} by {y_var}")
+            
+    fig.update_layout(height=500, paper_bgcolor="#e5ecf6", plot_bgcolor="#f9f9f9")
+    
+    toggle_style = {"display": "block"} if both_categorical else {"display": "none"}
+    
+    res = html.Div([
+        dcc.Graph(figure=fig)
+    ], style={"padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"})
+
+    return res, toggle_style
+
+# Drag and drop split-pane logic
+clientside_callback(
+    '''
+    function(id) {
+        var attachDrag = function() {
+            var divider = document.getElementById('join-drag-divider');
+            var leftPane = document.getElementById('join-left-pane');
+            var container = document.getElementById('join-split-container');
+            
+            if(!divider || !leftPane || !container) {
+                setTimeout(attachDrag, 500);
+                return;
+            }
+            
+            if(divider.dataset.listenerAttached === 'true') return;
+            divider.dataset.listenerAttached = 'true';
+            
+            var isResizing = false;
+            
+            divider.addEventListener('mousedown', function(e) {
+                isResizing = true;
+                document.body.style.cursor = 'col-resize';
+                document.body.style.userSelect = 'none'; // Prevent text selection
+                divider.style.backgroundColor = '#007bff';
+                e.preventDefault();
+            });
+            
+            document.addEventListener('mousemove', function(e) {
+                if (!isResizing) return;
+                var containerOffsetLeft = container.getBoundingClientRect().left;
+                var newWidth = e.clientX - containerOffsetLeft;
+                
+                var minW = container.getBoundingClientRect().width * 0.15;
+                var maxW = container.getBoundingClientRect().width * 0.85;
+                if(newWidth < minW) newWidth = minW;
+                if(newWidth > maxW) newWidth = maxW;
+                
+                leftPane.style.width = newWidth + 'px';
+                leftPane.style.flex = '0 0 auto';
+                e.preventDefault();
+            });
+            
+            document.addEventListener('mouseup', function(e) {
+                if (isResizing) {
+                    isResizing = false;
+                    document.body.style.cursor = '';
+                    document.body.style.userSelect = '';
+                    divider.style.backgroundColor = '#f4f4f4';
+                }
+            });
+        };
+        
+        attachDrag();
+        return window.dash_clientside.no_update;
+    }
+    ''',
+    Output('join-drag-divider', 'className'),
+    Input('join-drag-divider', 'id')
+)
