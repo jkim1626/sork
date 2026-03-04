@@ -1,7 +1,5 @@
 from dash import dcc, html, Dash
 from dash.dependencies import Input, Output
-from tabs.dataset import dataset_layout
-from tabs.stats import stats_layout
 from tabs.upload import upload_layout
 from tabs.download import download_layout
 from tabs.map import map_layout
@@ -143,8 +141,6 @@ def serve_layout():
                     # Give the tabs a unique ID that all components can access
                     dcc.Tabs(id='main-tabs', value='map-tab', children=[
                         map_layout,
-                        dataset_layout,
-                        stats_layout,
                         joins_layout,
                         upload_layout,
                         download_layout,
