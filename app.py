@@ -145,8 +145,8 @@ def serve_layout():
                         upload_layout,
                         download_layout,
                     ], className="mb-4") 
-                ], className="col-10 mx-auto", style={"minHeight": "calc(100vh - 200px)"})
-            ], style={"flex": "1 0 auto"}),
+                ], className="col-10 mx-auto", style={"flex": "1 1 auto", "display": "flex", "flexDirection": "column", "minHeight": 0, "overflow": "hidden"})
+            ], style={"flex": "1 1 auto", "display": "flex", "flexDirection": "column", "minHeight": 0, "overflow": "hidden"}),
             
             # Footer that stays at the bottom
             html.Footer(

@@ -5,3 +5,60 @@ button.logout-button {
 button.login-button {
     color: white !important;
 }
+
+/* Make Dash tabs fill available height — scoped to joins tab only */
+.tab-container, .tab-content {
+    min-height: 0;
+}
+
+/* Joins tab split container: use viewport height so children can scroll */
+#join-split-container {
+    height: calc(100vh - 110px) !important;
+    min-height: 400px;
+}
+
+/* Left pane: scrollable with visible border */
+#join-left-pane {
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    height: 100% !important;
+    background-color: #f8faf8;
+    border: 1px solid #d0d0d0;
+    border-right: none;
+    border-radius: 6px 0 0 6px;
+    padding: 15px !important;
+}
+
+/* Right pane: scrollable with visible border */
+#join-right-pane {
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
+    height: 100% !important;
+    background-color: #fafafa;
+    border: 1px solid #d0d0d0;
+    border-left: none;
+    border-radius: 0 6px 6px 0;
+    padding: 15px !important;
+}
+
+/* Draggable divider: prominent and easy to grab */
+#join-drag-divider {
+    background-color: #c8c8c8 !important;
+    border-left: 1px solid #b0b0b0 !important;
+    border-right: 1px solid #b0b0b0 !important;
+    width: 10px !important;
+    min-width: 10px !important;
+    cursor: col-resize !important;
+    z-index: 20 !important;
+    position: relative !important;
+}
+
+#join-drag-divider:hover {
+    background-color: #007bff !important;
+}
+
+/* AG Grid wrapper: no extra scroll layer */
+#join-grid-wrapper {
+    overflow: visible !important;
+    max-height: none !important;
+}
