@@ -1,96 +1,133 @@
-from dash import dcc, html, Input, Output, State, callback, dash_table
+import logging
+
+from dash import dcc, html, Input, Output, State, callback
 from dash.exceptions import PreventUpdate
 import dash
 import pandas as pd
 import io
 import base64
-from database import fetch_data_from_sql
+from dash_ag_grid import AgGrid
+from data_access import (
+    DatabaseAccessError,
+    append_dataframe_to_table,
+    get_allowed_tables,
+    get_table_columns,
+    get_table_schema_preview,
+)
 from dotenv import load_dotenv
-import os
 
 # Load environment variables
 load_dotenv(override=True)
 
 # Table Options
-table_options = os.getenv("TABLE_OPTIONS").split(",")
+table_options = get_allowed_tables()
+logger = logging.getLogger(__name__)
 
-# Database connection settings from environment variables
-driver = "ODBC Driver 17 for SQL Server"
-server = os.getenv("DB_SERVER")
-database = os.getenv("DB_DATABASE")
-username = os.getenv("DB_USERNAME")
-password = os.getenv("DB_PASSWORD")
 
-# SQL Alchemy connection string
-connection_string = (
-    f"mssql+pyodbc://{username}:{password}@{server}/{database}"
-    f"?driver={driver}&Encrypt=yes&TrustServerCertificate=yes"
-)
+def _status(message, kind="warning", title=None):
+    children = []
+    if title:
+        children.append(html.H6(title, className="section-title"))
+    children.append(html.P(message, className="section-copy"))
+    return html.Div(children, className=f"status-{kind}")
+
+
+def _make_grid(df, grid_id, height=320):
+    return AgGrid(
+        id=grid_id,
+        rowData=df.to_dict("records"),
+        columnDefs=[
+            {
+                "headerName": str(column),
+                "field": str(column),
+                "filter": True,
+                "sortable": True,
+                "resizable": True,
+                "minWidth": 120,
+            }
+            for column in df.columns
+        ],
+        defaultColDef={"filter": True, "sortable": True, "resizable": True},
+        dashGridOptions={"pagination": True, "paginationPageSize": 10, "animateRows": False},
+        className="ag-theme-alpine compact-grid",
+        style={"width": "100%", "height": f"{height}px"},
+    )
+
+
+def _make_simple_table(df):
+    header = html.Thead(html.Tr([html.Th(str(column)) for column in df.columns]))
+    body = html.Tbody(
+        [
+            html.Tr([html.Td("" if pd.isna(value) else str(value)) for value in row])
+            for row in df.itertuples(index=False, name=None)
+        ]
+    )
+    return html.Div(
+        html.Table([header, body], className="simple-data-table"),
+        className="simple-data-table-wrap",
+    )
 
 upload_layout = dcc.Tab(
     [
         # Store the tab's active state
         dcc.Store(id="upload-tab-active", data=False),
-        html.Br(),
-        html.H4("Upload CSV File to Database", style={"marginBottom": "20px"}),
-        
-        # Table selection
-        html.Label("Select target table:", style={"fontWeight": "bold", "marginBottom": "5px", "fontSize": "16px"}),
-        dcc.Dropdown(table_options, id="upload_table_dropdown", placeholder="Select a table"),
-        
-        html.Div([
-            # File upload component
-            html.Div([
-                html.Label("Upload CSV file:", style={"fontWeight": "bold", "marginTop": "20px", "marginBottom": "10px"}),
-                dcc.Upload(
-                    id='upload-csv',
-                    children=html.Div([
-                        html.A('Drag and Drop or ', style={"textDecoration": "underline"}),
-                        html.A('Select a CSV File')
-                    ]),
-                    style={
-                        'width': '100%',
-                        'height': '60px',
-                        'lineHeight': '60px',
-                        'borderWidth': '1px',
-                        'borderStyle': 'dashed',
-                        'borderRadius': '5px',
-                        'textAlign': 'center',
-                        'backgroundColor': '#f9f9f9',
-                        'margin': '10px 0'
-                    },
-                    multiple=False
+        html.Div(
+            [
+                html.H4("Upload Data", className="page-title"),
+                html.P(
+                    "Add CSV rows to an approved database table. The file must use the same column names and order shown in the table structure preview.",
+                    className="page-intro",
                 ),
-            ]),
-            
-            # Table structure information
-            html.Div(id="table-structure-info", style={"marginTop": "20px"}),
-            
-            # Upload result or validation errors
-            html.Div(id="upload-status", style={"marginTop": "20px"}),
-            
-            # CSV preview
-            html.Div(id="csv-preview", style={"marginTop": "20px"}),
-            
-            # Upload button
-            html.Div([
-                html.Button("Upload to Database", 
-                           id="upload-button", 
-                           disabled=True,
-                           style={"marginTop": "20px", 
-                                 "padding": "10px 20px", 
-                                 "backgroundColor": "#007bff", 
-                                 "color": "white", 
-                                 "border": "none", 
-                                 "borderRadius": "4px",
-                                 "cursor": "pointer"}
-                          )
-            ]),
-            
-            # Upload result
-            html.Div(id="upload-result", style={"marginTop": "20px"})
-            
-        ], id="upload-container", style={"display": "none"})
+            ],
+            className="page-header-block",
+        ),
+        html.Div(
+            [
+                html.Div(
+                    [
+                        html.H6("Target Table", className="section-title"),
+                        dcc.Dropdown(
+                            table_options,
+                            id="upload_table_dropdown",
+                            placeholder="Choose a destination table",
+                            maxHeight=420,
+                        ),
+                        html.P("Choose where these rows should be appended.", className="section-copy"),
+                    ],
+                    className="panel-card upload-target-panel",
+                ),
+                html.Div(
+                    [
+                        html.Div(
+                            [
+                                html.H6("CSV File", className="section-title"),
+                                dcc.Upload(
+                                    id='upload-csv',
+                                    children=html.Div("Drop a CSV file here or select one"),
+                                    className="upload-dropzone",
+                                    multiple=False,
+                                ),
+                            ],
+                            className="panel-card",
+                        ),
+                        html.Div(id="table-structure-info"),
+                        html.Div(id="upload-status"),
+                        html.Div(id="csv-preview"),
+                        html.Div(
+                            [
+                                html.Button("Upload to Database", id="upload-button", disabled=True, className="btn btn-success"),
+                            ],
+                            className="button-row",
+                        ),
+                        html.Div(id="upload-result"),
+                    ],
+                    id="upload-container",
+                    className="upload-workspace",
+                    style={"display": "none"},
+                ),
+            ],
+            className="upload-workspace",
+        ),
     ],
     label="Upload",
     id="upload-tab",
@@ -119,12 +156,7 @@ def set_upload_tab_active(tab_value):
     prevent_initial_call=True
 )
 def reset_upload_tab_data(is_active):
-    if not is_active:
-        # Reset all controls when leaving the tab
-        return None, None, True, [], [], [], [], {"display": "none"}
-    else:
-        # Don't reset when entering the tab
-        return [dash.no_update] * 8
+    raise PreventUpdate
 
 # Callback to show upload container when table is selected
 @callback(
@@ -147,43 +179,23 @@ def display_table_structure(selected_table):
     
     try:
         # Get a sample row to determine columns and types
-        sample_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
-        
-        # Get column details
-        columns = sample_df.columns.tolist()
-        dtypes = sample_df.dtypes.to_dict()
+        schema_df = get_table_schema_preview(selected_table)
         
         # Create table structure information
         structure_info = [
-            html.H5("Table Structure", style={"marginBottom": "10px"}),
-            html.P(f"This table has {len(columns)} columns:", style={"marginBottom": "5px"}),
-            html.Div([
-                dash_table.DataTable(
-                    data=[{"Column": col, "Data Type": str(dtypes[col])} for col in columns],
-                    columns=[
-                        {"name": "Column", "id": "Column"},
-                        {"name": "Data Type", "id": "Data Type"}
-                    ],
-                    style_table={'overflowX': 'auto'},
-                    style_cell={
-                        'textAlign': 'left',
-                        'padding': '8px',
-                        'minWidth': '100px',
-                    },
-                    style_header={
-                        'backgroundColor': '#d1d1d1',
-                        'fontWeight': 'bold'
-                    },
-                )
-            ])
+            html.H6("Destination Table Structure", className="section-title"),
+            html.P(f"This table has {len(schema_df)} columns. Your CSV must match this order.", className="section-copy"),
+            _make_grid(
+                schema_df.rename(columns={"COLUMN_NAME": "Column", "DATA_TYPE": "Data Type"}),
+                "upload-schema-grid",
+                height=280,
+            ),
         ]
         
-        return structure_info
-    except Exception as e:
-        return html.Div([
-            html.H5("Error Retrieving Table Structure", style={"color": "red"}),
-            html.P(str(e))
-        ])
+        return html.Div(structure_info, className="panel-card")
+    except DatabaseAccessError as e:
+        logger.exception("Unable to load upload table structure for %s", selected_table)
+        return _status("Table structure is unavailable right now. Choose another table or try again later.", "warning", "Table structure unavailable")
 
 # Function to parse CSV content
 def parse_csv(contents):
@@ -193,10 +205,14 @@ def parse_csv(contents):
     decoded = base64.b64decode(content_string)
     
     try:
-        df = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
+        decoded_text = decoded.decode('utf-8-sig')
+        df = pd.read_csv(io.StringIO(decoded_text))
+        if df.empty:
+            return None, "The CSV was read successfully but contains no data rows."
         return df, None
     except Exception as e:
-        return None, f"Error parsing CSV: {str(e)}"
+        logger.exception("Unable to parse uploaded CSV")
+        return None, "The CSV could not be read. Confirm it is a valid comma-separated file with a header row."
 
 # Callback to validate CSV file and display preview
 @callback(
@@ -212,47 +228,56 @@ def validate_and_preview_csv(contents, selected_table, filename):
         return [], [], True
     
     try:
-        # Get table structure from database
-        sample_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
-        table_columns = sample_df.columns.tolist()
+        table_columns = get_table_columns(selected_table)
         
         # Parse the uploaded CSV
         df, error = parse_csv(contents)
         if error:
-            return [], html.Div([
-                html.H5("Error", style={"color": "red"}),
-                html.P(error)
-            ]), True
+            return [], _status(error, "error", "CSV could not be read"), True
         
-        # Verify column count matches
+        # Verify column names and order match. The database insert maps by name now,
+        # so this prevents silent misloads when a same-width CSV is arranged differently.
         if len(df.columns) != len(table_columns):
             return get_preview_table(df), html.Div([
-                html.H5("Validation Error", style={"color": "red"}),
-                html.P(f"CSV file has {len(df.columns)} columns, but the database table has {len(table_columns)} columns."),
-                html.P("Column counts must match to proceed.")
-            ]), True
+                html.H6("Validation Error", className="section-title"),
+                html.P(
+                    f"{filename or 'This CSV'} has {len(df.columns)} columns, but '{selected_table}' expects {len(table_columns)}.",
+                    className="section-copy",
+                ),
+                html.P("Column counts must match to proceed.", className="section-copy"),
+                html.P(f"Expected order: {', '.join(table_columns)}", className="section-copy")
+            ], className="status-error"), True
+        if list(df.columns) != table_columns:
+            return get_preview_table(df), html.Div([
+                html.H6("Validation Error", className="section-title"),
+                html.P("Column names and order must match the destination table before upload.", className="section-copy"),
+                html.P(f"Expected order: {', '.join(table_columns)}", className="section-copy"),
+                html.P(f"Uploaded order: {', '.join(map(str, df.columns))}", className="section-copy")
+            ], className="status-error"), True
         
-        # Check for consistent row lengths (all rows have same number of columns)
-        if df.isnull().any(axis=1).sum() > 0:
-            # Some rows have missing values, but we'll convert them to None/NULL on upload
+        missing_rows = int(df.isnull().any(axis=1).sum())
+        if missing_rows > 0:
             warning = html.Div([
-                html.H5("Warning", style={"color": "orange"}),
-                html.P(f"CSV file has some rows with missing values. These will be converted to NULL in the database."),
-                html.P("Preview below shows data as it will be uploaded.")
-            ])
+                html.H6("Ready with Warnings", className="section-title"),
+                html.P(
+                    f"{filename or 'This CSV'} has {missing_rows} row(s) with missing values. Empty cells will be uploaded as NULL.",
+                    className="section-copy",
+                ),
+                html.P(f"Expected destination columns: {', '.join(table_columns)}", className="section-copy"),
+                html.P("Preview below shows data as it will be uploaded.", className="section-copy")
+            ], className="status-warning")
         else:
             warning = html.Div([
-                html.H5("Validation Successful", style={"color": "green"}),
-                html.P(f"CSV file with {len(df)} rows is ready to upload to table '{selected_table}'.")
-            ])
+                html.H6("Ready to Upload", className="section-title"),
+                html.P(f"{filename or 'This CSV'} with {len(df)} rows is ready for '{selected_table}'.", className="section-copy"),
+                html.P(f"Expected destination columns: {', '.join(table_columns)}", className="section-copy")
+            ], className="status-success")
         
         return get_preview_table(df), warning, False
         
-    except Exception as e:
-        return [], html.Div([
-            html.H5("Error", style={"color": "red"}),
-            html.P(str(e))
-        ]), True
+    except DatabaseAccessError as e:
+        logger.exception("Unable to validate upload for %s", selected_table)
+        return [], _status("Validation is unavailable right now. Try another table or try again later.", "warning", "Validation unavailable"), True
 
 # Helper function to create preview table
 def get_preview_table(df):
@@ -260,30 +285,15 @@ def get_preview_table(df):
     df_preview = df.head(preview_rows)
     
     return [
-        html.H5("CSV Preview", style={"marginBottom": "10px"}),
-        html.P(f"Showing first {preview_rows} of {len(df)} rows:", style={"marginBottom": "5px"}),
-        dash_table.DataTable(
-            data=df_preview.to_dict('records'),
-            columns=[{"name": str(i), "id": str(i)} for i in df_preview.columns],
-            style_table={'overflowX': 'auto'},
-            style_cell={
-                'textAlign': 'left',
-                'padding': '8px',
-                'minWidth': '100px',
-                'maxWidth': '200px',
-                'overflow': 'hidden',
-                'textOverflow': 'ellipsis',
-            },
-            style_header={
-                'backgroundColor': '#d1d1d1',
-                'fontWeight': 'bold'
-            },
-            tooltip_delay=0,
-            tooltip_duration=None,
-            page_size=10,
+        html.Div(
+            [
+                html.H6("CSV Preview", className="section-title"),
+                html.P(f"Showing first {preview_rows} of {len(df)} rows.", className="section-copy"),
+                _make_simple_table(df_preview),
+            ],
+            className="panel-card",
         )
     ]
-"""
 # Callback to handle database upload
 @callback(
     Output("upload-result", "children"),
@@ -293,41 +303,24 @@ def get_preview_table(df):
      State("upload-csv", "filename")]
 )
 def upload_to_database(n_clicks, contents, selected_table, filename):
-    if n_clicks is None or contents is None or selected_table is None:
+    if not n_clicks or contents is None or selected_table is None:
         raise PreventUpdate
     
     try:
-        # Parse the uploaded CSV
         df, error = parse_csv(contents)
         if error:
-            return html.Div([
-                html.H5("Upload Error", style={"color": "red"}),
-                html.P(error)
-            ])
+            return _status(error, "error", "Upload Error")
         
-        # Get table structure
-        sample_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
-        table_columns = sample_df.columns.tolist()
-        
-        # Rename CSV columns to match database columns
-        if len(df.columns) == len(table_columns):
-            df.columns = table_columns
-        
-        # Create database connection
-        engine = create_engine(connection_string, fast_executemany=True)
-        
-        # Upload data to the database
-        with engine.begin() as connection:
-            df.to_sql(selected_table, connection, if_exists='append', index=False, schema='dbo')
+        uploaded_rows = append_dataframe_to_table(selected_table, df)
         
         return html.Div([
-            html.H5("Upload Successful", style={"color": "green"}),
-            html.P(f"Successfully uploaded {len(df)} rows to table '{selected_table}'.")
-        ])
+            html.H6("Upload Successful", className="section-title"),
+            html.P(
+                f"Successfully uploaded {uploaded_rows} rows from '{filename or 'uploaded file'}' to '{selected_table}'.",
+                className="section-copy",
+            )
+        ], className="status-success")
         
-    except Exception as e:
-        return html.Div([
-            html.H5("Upload Error", style={"color": "red"}),
-            html.P(str(e))
-        ])
-"""
+    except DatabaseAccessError as e:
+        logger.exception("Unable to upload CSV to %s", selected_table)
+        return _status("Upload failed before rows were added. Check that the file still matches the destination table and try again.", "error", "Upload Error")

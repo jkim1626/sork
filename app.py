@@ -4,10 +4,11 @@ from tabs.upload import upload_layout
 from tabs.download import download_layout
 from tabs.map import map_layout
 from tabs.joins import joins_layout
+from components.shell import build_app_bar, build_content_frame, build_footer, build_tabs
 import os
 import secrets
 from dotenv import load_dotenv
-from flask import Flask, redirect, session, jsonify, request
+from flask import Flask, redirect, session
 from authlib.integrations.flask_client import OAuth
 from urllib.parse import parse_qs
 
@@ -72,7 +73,6 @@ def unauthorized():
 css = ["https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css"]
 app = Dash(name="Sork Lab Dashboard", server=server, external_stylesheets=css, suppress_callback_exceptions=True)
 
-# Font editting and coloring
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -82,24 +82,6 @@ app.index_string = '''
         <title>{%title%}</title>
         {%favicon%}
         {%css%}
-        <style>
-            body {
-                font-family: 'Gowun Batang', serif;
-                color: #133817;
-            }
-
-            h1, h2, h3, h4, h5, h6, p, div, span, a, button {
-                color: #133817 !important;
-            }
-
-            .btn, .btn-primary, .btn-outline-secondary {
-                color: #133817 !important;  
-            }
-
-            .text-muted {
-                color: #133817 !important;
-            }
-        </style>
     </head>
     <body>
         {%app_entry%}
@@ -112,113 +94,128 @@ app.index_string = '''
 </html>
 '''
 
+TAB_SPECS = [
+    ("Select and Filter", joins_layout),
+    ("Tree Sites", map_layout),
+    ("Upload", upload_layout),
+    ("Files", download_layout),
+]
+
+
+def build_user_actions():
+    return [
+        html.Div(
+            className="user-chip",
+            children=[
+                html.Div("SL", className="user-chip__avatar"),
+                html.Div(id='user-info', className="user-chip__text"),
+            ],
+        ),
+        html.A(
+            html.Button("Logout", className="btn btn-outline-secondary btn-sm logout-button"),
+            href="/logout",
+            className="logout-link",
+        ),
+    ]
+
+
+def build_authenticated_layout():
+    return html.Div(
+        className="app-shell",
+        children=[
+            dcc.Location(id='url', refresh=False),
+            build_app_bar("Dashboard", actions=build_user_actions()),
+            html.Main(
+                className="app-shell__body",
+                children=[
+                    build_content_frame(
+                        [
+                            html.Div(
+                                className="content-frame__header",
+                                children=[
+                                    html.Div(
+                                        [
+                                            html.P("Research Workspace", className="content-frame__eyebrow"),
+                                            html.H2("Shared data tools", className="content-frame__title"),
+                                            html.P(
+                                                "Browse tree sites, join datasets, upload data, and export curated slices from one shell.",
+                                                className="content-frame__subtitle",
+                                            ),
+                                        ]
+                                    )
+                                ],
+                            ),
+                            build_tabs(TAB_SPECS, tabs_id='main-tabs', active_value='joins-tab'),
+                        ]
+                    )
+                ],
+            ),
+            build_footer("Sork Lab Dashboard © 2025"),
+        ],
+    )
+
+
+def build_guest_layout():
+    return html.Div(
+        className="app-shell",
+        children=[
+            dcc.Location(id='url', refresh=False),
+            build_app_bar(
+                "Dashboard",
+                actions=[
+                    html.A(
+                        html.Button("Login", className="btn btn-primary btn-sm login-button"),
+                        href="/login",
+                    )
+                ],
+            ),
+            html.Main(
+                className="app-shell__body",
+                children=[
+                    build_content_frame(
+                        html.Div(
+                            className="login-panel",
+                            children=[
+                                html.P("Protected access", className="content-frame__eyebrow"),
+                                html.H2("Welcome to Sork Lab Dashboard", className="content-frame__title"),
+                                html.P(
+                                    "Log in to work with the full dashboard. The map preview below remains visible for quick public browsing.",
+                                    className="content-frame__subtitle",
+                                ),
+                                html.Div(id='error-message', className="login-panel__error"),
+                                html.A(
+                                    html.Button("Login", className="btn btn-primary login-button"),
+                                    href="/login",
+                                    className="login-panel__action",
+                                ),
+                            ],
+                        ),
+                        class_name="content-frame--narrow",
+                    ),
+                    build_content_frame(
+                        [
+                            html.Div(
+                                className="content-frame__header",
+                                children=[
+                                    html.P("Preview", className="content-frame__eyebrow"),
+                                    html.H2("Tree Sites", className="content-frame__title"),
+                                ],
+                            ),
+                            map_layout,
+                        ]
+                    ),
+                ],
+            ),
+            build_footer("Sork Lab Dashboard © 2025"),
+        ],
+    )
+
+
 def serve_layout():
 
-    dcc.Location(id='url', refresh=False)
-
-    if 'user' in session: # Authenticated layout
-        return html.Div([
-            # Main content wrapper with flexible height
-            html.Div([
-                # Header
-                html.Div(
-                    html.H1("Sork Lab Dashboard", className="text-center fw-bold"),
-                    style={"backgroundColor": '#e9ebe8', "padding": "15px"}
-                ),
-                # AUTH0 CHECK -- TEST
-                html.Div([
-                    html.Div(id='user-info', className="mb-2"),
-                    html.A(
-                        html.Button("Login", className="btn btn-primary btn-sm login-button"), 
-                        href="/login"),
-                    html.A(
-                        html.Button("Logout", className="btn btn-outline-secondary btn-sm logout-button"), 
-                        href="/logout")
-                ], className="col-3 text-end"),
-                # Tab content container
-                html.Div([
-                    html.Br(),
-                    # Give the tabs a unique ID that all components can access
-                    dcc.Tabs(id='main-tabs', value='map-tab', children=[
-                        map_layout,
-                        joins_layout,
-                        upload_layout,
-                        download_layout,
-                    ], className="mb-4") 
-                ], className="col-10 mx-auto", style={"flex": "1 1 auto", "display": "flex", "flexDirection": "column", "minHeight": 0, "overflow": "hidden"})
-            ], style={"flex": "1 1 auto", "display": "flex", "flexDirection": "column", "minHeight": 0, "overflow": "hidden"}),
-            
-            # Footer that stays at the bottom
-            html.Footer(
-                html.Div("Sork Lab Dashboard © 2025", className="text-center text-muted py-3"),
-                style={
-                    "backgroundColor": "#e9ebe8", 
-                    "color": "#e3e3e3", 
-                    "padding": "20px", 
-                    "width": "100%",
-                    "marginTop": "40px"
-                }
-            )
-        ], style={
-            "backgroundColor": "#e9ebe8", 
-            "minHeight": "100vh",
-            "display": "flex",
-            "flexDirection": "column"
-        }) 
-    else: # Not authenticated
-        return html.Div([
-            # Header
-            html.Div(
-                html.H1("Sork Lab Dashboard", className="text-center fw-bold"),
-                style={"backgroundColor": 'e9ebe8', "padding": "15px"}
-            ),
-            # Errors
-            html.Div([
-                dcc.Location(id='url', refresh=False),
-                html.Div(id='error-message'),
-            ]),
-            # Login content
-            html.Div([
-                html.Div([
-                    html.H2("Welcome to Sork Lab Dashboard", className="text-center"),
-                    html.P("Please log in to access the dashboard features.", className="text-center"),
-                    html.Div([
-                        html.A(
-                            html.Button("Login", className="btn btn-primary"),
-                            href="/login",
-                            className="d-block mx-auto",
-                            style={"width": "fit-content"}
-                        )
-                    ], className="text-center")
-                ], className="p-5 bg-white rounded shadow")
-            ], className="col-6 mx-auto mt-5"),
-
-            # Maps tab
-            html.Div([
-                html.Br(), 
-                map_layout
-            ], className="p-4 bgwhite rounded shadow mt-5", style={
-                "width": "90%", 
-                "margin": "0 auto"
-            }), 
-
-            # Footer that stays at the bottom
-            html.Footer(
-                html.Div("Sork Lab Dashboard © 2025", className="text-center text-muted py-3"),
-                style={
-                    "backgroundColor": "#e9ebe8", 
-                    "color": "#e3e3e3", 
-                    "padding": "20px", 
-                    "width": "100%",
-                    "marginTop": "40px"
-                }
-            )
-        ], style={
-            "backgroundColor": "#e9ebe8", 
-            "minHeight": "100vh",
-            "display": "flex",
-            "flexDirection": "column"
-        })
+    if 'user' in session:
+        return build_authenticated_layout()
+    return build_guest_layout()
         
 
 app.layout = serve_layout
@@ -250,4 +247,4 @@ def display_error_message(search):
     return ""
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, use_reloader=False)

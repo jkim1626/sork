@@ -1,3 +1,5 @@
+import logging
+
 from dash import dcc, html, Input, Output, State, callback, ctx, clientside_callback
 from dash.exceptions import PreventUpdate
 import dash
@@ -28,6 +30,7 @@ stat_test_options = [
 
 # Load environment variables
 load_dotenv(override=True)
+logger = logging.getLogger(__name__)
 
 # ===== CONFIGURATION CONSTANTS =====
 
@@ -65,11 +68,15 @@ joins_layout = dcc.Tab(
 
                 # Introduction section
                 html.Div([
-                    html.H4("Join Your Data", style={"marginBottom": "10px", "color": "#133817"}),
+                    html.H4("Select & Filter Data", style={"marginBottom": "10px", "color": "#133817"}),
                     html.P(
-                        "Automatically combines your garden dataset with maternal tree climate data and garden climate data. "
-                        "Select the columns you need from each data source, optionally filter by year, then click Join.",
+                        "Start with the garden dataset, apply early filters, then choose only the variables you need. "
+                        "The dashboard handles the join logic behind the scenes and shows a limited preview by default.",
                         style={"color": "#666", "marginBottom": "20px", "fontSize": "0.95em"}
+                    ),
+                    html.Div(
+                        "Warning: larger joins and exports may take a while. Safe defaults are enabled so you preview results before pulling everything.",
+                        style={"backgroundColor": "#fff3cd", "border": "1px solid #ffe69c", "padding": "10px 12px", "borderRadius": "6px", "fontSize": "0.9em"},
                     ),
                 ], style={"marginBottom": "25px", "padding": "15px", "backgroundColor": "#f0f7f2", "borderRadius": "8px"}),
 
@@ -242,7 +249,7 @@ joins_layout = dcc.Tab(
                         dcc.Checklist(
                             id="join-limit-rows-toggle",
                             options=[{"label": " Limit rows displayed", "value": "limit"}],
-                            value=[],
+                            value=["limit"],
                             inline=True,
                             style={"fontWeight": "bold", "display": "inline-block", "marginRight": "15px"}
                         ),
@@ -252,14 +259,14 @@ joins_layout = dcc.Tab(
                         html.Label("Max rows:", style={"marginRight": "8px"}),
                         dcc.Input(id="join-row-count", type="number", min=1, max=1000000, value=100,
                                 style={"width": "100px"}, debounce=True),
-                    ], id="join-row-count-input-wrapper", style={"display": "none", "alignItems": "center"}),
+                    ], id="join-row-count-input-wrapper", style={"display": "flex", "alignItems": "center"}),
                 ], id="join-row-count-container", style={"display": "none", "marginBottom": "15px"}),
                 
                 # Error message div
                 html.Div([
                     html.Div([
                         html.Strong("⚠️ Please select at least one data source", style={"color": "#dc3545"}),
-                        html.P("You need to select at least one column from either Maternal Tree Data or Garden Climate Data to proceed.", 
+                        html.P("Select at least one variable from the garden dataset, maternal tree climate, or garden climate sections to proceed.", 
                                style={"color": "#666", "marginTop": "5px", "marginBottom": "0", "fontSize": "0.9em"})
                     ])
                 ], id="join-tab-execute-error", style={"display": "none", "textAlign": "center", "marginTop": "20px",
@@ -352,7 +359,11 @@ joins_layout = dcc.Tab(
                 # Statistical Analysis Section (Appended to Joins Tab)
                 # -------------------------------------------------------------
                 html.Div([
-                    html.H4("Statistical Analysis on Resulting Data", style={"marginBottom": "20px"}),
+                    html.H4("Optional Statistics & Figures", style={"marginBottom": "20px"}),
+                    html.P(
+                        "Run lightweight summaries and figures after you confirm the previewed dataset looks right. These analyses operate on filtered results and may be capped for performance.",
+                        style={"color": "#666", "marginBottom": "15px"},
+                    ),
 
                     # Test selection (only shows when there's data)
                     html.Div([
@@ -640,17 +651,7 @@ def set_tab_active(tab_value):
     prevent_initial_call=True
 )
 def reset_tab_data(is_active):
-    if is_active:
-        raise PreventUpdate
-    # Reset all controls when leaving the tab
-    return (None, [], [], [], [], [], [], 
-            {"display": "none"}, {"display": "none"}, {"display": "none"}, 
-            {"display": "none"}, {"display": "none"}, {"display": "none"},
-            "", {"display": "none"}, "", None, html.Div(), "joined_data", 100, {"display": "none"}, "",
-            [], [], [], [], {"display": "none"}, [],
-            {"display": "none"}, None, {"display": "none"},
-            html.Div(), html.Div(), html.Div(), html.Div(),
-            {"display": "block", "height": "100%"})
+    raise PreventUpdate
 
 # Cache metadata when tab becomes active
 @callback(
@@ -779,12 +780,12 @@ def update_core_table_columns(selected_table, metadata_store):
                 "",
                 year_options, site_options, show_prefilter)
     except ValueError as ve:
-        error_msg = f"Security Error: {str(ve)}"
-        print(error_msg)
+        logger.exception("Invalid core table selection in Select and Filter")
+        error_msg = "That table is not available in this workflow."
         return [], [], {"display": "none"}, [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg, [], [], {"display": "none"}
     except Exception as e:
-        error_msg = f"Error fetching columns: {str(e)}"
-        print(error_msg)
+        logger.exception("Unable to fetch Select and Filter columns")
+        error_msg = "Column choices are unavailable right now. Try another dataset or try again later."
         return [], [], {"display": "none"}, [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg, [], [], {"display": "none"}
 
 # Handle Core table Select All and Deselect All buttons
@@ -906,9 +907,9 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars, year_filt
             html.Span(match_info, style={"fontSize": "0.85em", "color": "#888", "marginLeft": "20px"})
         ], style={"marginBottom": "8px"}))
     
-    if not tree_vars and not garden_vars:
+    if not core_vars and not tree_vars and not garden_vars:
         preview_parts.append(html.Div([
-            html.Span("ERROR: Select at least one data source to combine", style={"color": "#ffc107", "fontStyle": "italic"})
+            html.Span("Select at least one variable to preview results.", style={"color": "#856404", "fontStyle": "italic"})
         ]))
     
     return preview_parts, {"display": "block", "marginBottom": "20px", "padding": "15px", 
@@ -939,7 +940,7 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars, year_filt
     prevent_initial_call=True,
 )
 def execute_join(n_clicks, core_table, core_table_vars, maternal_tree_vars, garden_climate_vars, year_filter, site_filter):
-    if not n_clicks or not core_table or (not maternal_tree_vars and not garden_climate_vars):
+    if not n_clicks or not core_table or (not core_table_vars and not maternal_tree_vars and not garden_climate_vars):
         raise PreventUpdate
 
     try:
@@ -1046,12 +1047,12 @@ FROM [dbo].[{core_table}] core
                 "Join Data & View Results", False, "", 100, {"display": "none"})
 
     except ValueError as ve:
-        error_msg = f"Security Error: {str(ve)}"
-        print("Security error:", error_msg)
+        logger.exception("Invalid join request")
+        error_msg = "That dataset selection is not available."
         return None, dash.no_update, {"display": "none"}, {"display": "none"}, "Join Data & View Results", False, error_msg, 100, {"display": "block", "height": "100%"}
     except Exception as e:
-        error_msg = f"Error executing join: {str(e)}"
-        print("SQL Error:", error_msg)
+        logger.exception("Unable to execute Select and Filter join")
+        error_msg = "Results could not be prepared. Try fewer variables or narrower filters."
         return None, dash.no_update, {"display": "none"}, {"display": "none"}, "Join Data & View Results", False, error_msg, 100, {"display": "block", "height": "100%"}
 
 # Toggle visibility of row count input
@@ -1259,9 +1260,9 @@ FROM (
         return grid_component, stats_text, max_rows_text, max_val, filtered_btn_text, full_btn_text, download_warning, {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, {"display": "block", "marginBottom": "15px"}, {"display": "none"}
 
     except Exception as e:
-        error_msg = f"Error updating grid display: {str(e)}"
-        print(error_msg)
-        error_div = html.Div(error_msg, style={"padding": "20px", "color": "red"})
+        logger.exception("Unable to update Select and Filter grid")
+        error_msg = "Results are unavailable right now. Try a smaller preview or adjust your filters."
+        error_div = html.Div(error_msg, className="status-warning")
         return error_div, "", "", 1000000, dash.no_update, dash.no_update, html.Div(), {"display": "none"}, {"display": "none"}, {"display": "block", "height": "100%"}
 
 # Reset results when any selection changes
@@ -1425,8 +1426,8 @@ def show_error_message(n_clicks, core_table_vars, maternal_tree_vars, garden_cli
     if n_clicks is None or n_clicks == 0:
         raise PreventUpdate
     
-    # Show error message if no maternal tree or garden climate variables are selected
-    if not maternal_tree_vars and not garden_climate_vars:
+    # Show error message if no variables are selected anywhere.
+    if not core_table_vars and not maternal_tree_vars and not garden_climate_vars:
         return {"display": "block", "textAlign": "center", "marginTop": "20px",
                 "padding": "15px", "backgroundColor": "#fff3cd", 
                 "borderRadius": "8px", "border": "1px solid #ffc107"}
