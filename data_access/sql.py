@@ -1,10 +1,9 @@
 import os
 import re
-from functools import lru_cache
 
 import pandas as pd
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 
 load_dotenv(override=True)
 
@@ -32,9 +31,12 @@ def _build_connection_string():
     )
 
 
-@lru_cache(maxsize=1)
 def get_engine():
-    return create_engine(_build_connection_string(), fast_executemany=True)
+    return create_engine(
+        _build_connection_string(),
+        fast_executemany=True,
+        pool_pre_ping=True,
+    )
 
 
 def get_allowed_tables():
@@ -55,30 +57,38 @@ def _validate_table_name(table_name):
 
 
 def fetch_query_dataframe(query):
+    engine = None
     try:
-        with get_engine().connect() as connection:
-            return pd.read_sql_query(text(query), connection)
+        engine = get_engine()
+        with engine.connect() as connection:
+            return pd.read_sql_query(query, connection)
     except DatabaseAccessError:
         raise
     except Exception as exc:
         raise DatabaseAccessError(f"Database query failed: {exc}") from exc
+    finally:
+        if engine is not None:
+            engine.dispose()
 
 
 def get_table_columns(table_name):
     validated_table = _validate_table_name(table_name)
-    query = text(
-        """
-        SELECT COLUMN_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = :table_name
-        ORDER BY ORDINAL_POSITION
-        """
-    )
+    query = """
+    SELECT COLUMN_NAME
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = :table_name
+    ORDER BY ORDINAL_POSITION
+    """
+    engine = None
     try:
-        with get_engine().connect() as connection:
+        engine = get_engine()
+        with engine.connect() as connection:
             df = pd.read_sql_query(query, connection, params={"table_name": validated_table})
     except Exception as exc:
         raise DatabaseAccessError(f"Unable to load columns for '{validated_table}': {exc}") from exc
+    finally:
+        if engine is not None:
+            engine.dispose()
 
     if df.empty:
         raise DatabaseAccessError(f"Table '{validated_table}' does not expose any columns.")
@@ -88,19 +98,22 @@ def get_table_columns(table_name):
 
 def get_table_schema_preview(table_name):
     validated_table = _validate_table_name(table_name)
-    query = text(
-        """
-        SELECT COLUMN_NAME, DATA_TYPE
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = :table_name
-        ORDER BY ORDINAL_POSITION
-        """
-    )
+    query = """
+    SELECT COLUMN_NAME, DATA_TYPE
+    FROM INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = :table_name
+    ORDER BY ORDINAL_POSITION
+    """
+    engine = None
     try:
-        with get_engine().connect() as connection:
+        engine = get_engine()
+        with engine.connect() as connection:
             return pd.read_sql_query(query, connection, params={"table_name": validated_table})
     except Exception as exc:
         raise DatabaseAccessError(f"Unable to load schema for '{validated_table}': {exc}") from exc
+    finally:
+        if engine is not None:
+            engine.dispose()
 
 
 def get_table_preview(table_name, limit=1):
@@ -195,10 +208,15 @@ def append_dataframe_to_table(table_name, df):
     upload_df = df.copy()
     upload_df = upload_df.where(pd.notnull(upload_df), None)
 
+    engine = None
     try:
-        with get_engine().begin() as connection:
+        engine = get_engine()
+        with engine.begin() as connection:
             upload_df.to_sql(validated_table, connection, if_exists="append", index=False, schema="dbo")
     except Exception as exc:
         raise DatabaseAccessError(f"Database upload failed: {exc}") from exc
+    finally:
+        if engine is not None:
+            engine.dispose()
 
     return len(upload_df)

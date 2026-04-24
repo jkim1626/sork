@@ -18,6 +18,7 @@ from dash import (
     no_update,
 )
 from dash_ag_grid import AgGrid
+from dash.exceptions import PreventUpdate
 from dotenv import load_dotenv
 
 from database import fetch_data_from_sql
@@ -25,8 +26,7 @@ from database import fetch_data_from_sql
 load_dotenv(override=True)
 logger = logging.getLogger(__name__)
 
-map_table = os.getenv("MAP_TABLE")
-table_options_env = os.getenv("TABLE_OPTIONS", "")
+map_table = (os.getenv("MAP_TABLE") or "").strip('"')
 dat_avail_table = os.getenv("DAT_AVAIL_TABLE")
 
 SEARCH_ID_COLUMNS = [
@@ -34,7 +34,6 @@ SEARCH_ID_COLUMNS = [
     {"label": "Sample ID", "value": "sample_id"},
 ]
 
-REQUIRED_MAP_COLUMNS = {"Latitude", "Longitude", "locality_full_name"}
 OPTIONAL_MAP_COLUMNS = ["Accession", "sample_id", "Year", "Site"]
 INDIVIDUAL_TREE_ZOOM_THRESHOLD = 8
 MAX_UPLOADED_MAP_ROWS = 10000
@@ -48,13 +47,6 @@ UCLA_COORDINATES = {
 }
 
 
-def _candidate_tables():
-    values = [value.strip() for value in table_options_env.split(",") if value.strip()]
-    if map_table and map_table not in values:
-        values.insert(0, map_table)
-    return values
-
-
 def _sanitize_identifier(name):
     if not name or not re.fullmatch(r"[\w \-()./]+", name):
         raise ValueError(f"Invalid identifier: {name}")
@@ -65,10 +57,6 @@ def _sql_literal(value):
     if value is None:
         return "NULL"
     return "'" + str(value).replace("'", "''") + "'"
-
-
-def _quoted_columns(columns):
-    return ", ".join(f"[{column}]" for column in columns)
 
 
 _TABLE_COLUMN_CACHE = {}
@@ -86,151 +74,117 @@ def get_table_columns(table_name):
     return columns
 
 
-def get_mappable_tables():
-    tables = []
-    for table_name in _candidate_tables():
-        try:
-            columns = set(get_table_columns(table_name))
-        except Exception:
-            continue
-        if REQUIRED_MAP_COLUMNS.issubset(columns):
-            tables.append(table_name)
-    return tuple(tables)
-
-
 def _map_source_options():
-    tables = list(get_mappable_tables())
-    if not tables:
-        tables = _candidate_tables()
-    options = [{"label": "All mappable datasets", "value": "__all__"}]
-    options.extend({"label": table_name, "value": table_name} for table_name in tables)
-    return options
+    if not map_table:
+        return [{"label": "Tree site records", "value": "__all__"}]
+    return [{"label": "Tree site records", "value": map_table}]
 
 
 def _initial_map_source_options():
-    options = [{"label": "All mappable datasets", "value": "__all__"}]
-    options.extend({"label": table_name, "value": table_name} for table_name in _candidate_tables())
-    return options
+    return _map_source_options()
 
 
-def _source_tables(selected_source):
-    if selected_source and selected_source != "__all__":
-        return [_sanitize_identifier(selected_source)]
-    mappable_tables = list(get_mappable_tables())
-    return mappable_tables or _candidate_tables()
+def _default_map_source_value():
+    return map_table or "__all__"
 
 
-def _optional_column_expr(column_name, columns):
-    if column_name in columns:
-        return f"[{column_name}] AS [{column_name}]"
-    return f"NULL AS [{column_name}]"
+def _map_table_name(_selected_source=None):
+    return _sanitize_identifier(map_table) if map_table else None
 
 
-def _build_map_union_query(selected_source):
-    selects = []
-    for table_name in _source_tables(selected_source):
-        columns = set(get_table_columns(table_name))
-        if not REQUIRED_MAP_COLUMNS.issubset(columns):
-            continue
-        select_parts = [
-            f"{_sql_literal(table_name)} AS [source_table]",
-            "[Latitude] AS [Latitude]",
-            "[Longitude] AS [Longitude]",
-            "[locality_full_name] AS [locality_full_name]",
-        ]
-        select_parts.extend(_optional_column_expr(column_name, columns) for column_name in OPTIONAL_MAP_COLUMNS)
-        selects.append(f"SELECT {', '.join(select_parts)} FROM [dbo].[{table_name}]")
-    if not selects:
-        return None
-    return "\nUNION ALL\n".join(selects)
+def _safe_fetch(query):
+    df = fetch_data_from_sql(query)
+    if df is None:
+        return pd.DataFrame()
+    return df
+
+
+def _table_has_column(column_name):
+    table_name = _map_table_name()
+    if not table_name:
+        return False
+    return column_name in set(get_table_columns(table_name))
+
+
+def _build_where_clause(selected_locations=None, selected_years=None):
+    clauses = ["[Latitude] IS NOT NULL", "[Longitude] IS NOT NULL"]
+    if selected_locations:
+        values = ", ".join(_sql_literal(value) for value in selected_locations)
+        clauses.append(f"[locality_full_name] IN ({values})")
+    if selected_years and _table_has_column("Year"):
+        values = ", ".join(_sql_literal(value) for value in selected_years)
+        clauses.append(f"[Year] IN ({values})")
+    return " AND ".join(clauses)
 
 
 def _build_site_aggregate_query(selected_source, selected_locations=None, selected_years=None):
-    base_query = _build_map_union_query(selected_source)
-    if not base_query:
+    table_name = _map_table_name(selected_source)
+    if not table_name:
         return None
-    where_clauses = ["Latitude IS NOT NULL", "Longitude IS NOT NULL"]
-    if selected_locations:
-        values = ", ".join(_sql_literal(value) for value in selected_locations)
-        where_clauses.append(f"locality_full_name IN ({values})")
-    if selected_years:
-        values = ", ".join(_sql_literal(value) for value in selected_years)
-        where_clauses.append(f"Year IN ({values})")
     return f"""
 SELECT
-    source_table,
-    locality_full_name,
-    AVG(Longitude) AS avg_longitude,
-    AVG(Latitude) AS avg_latitude,
+    [locality_full_name],
+    AVG([Longitude]) AS avg_longitude,
+    AVG([Latitude]) AS avg_latitude,
     COUNT(*) AS tree_count
-FROM (
-    {base_query}
-) q
-WHERE {' AND '.join(where_clauses)}
-GROUP BY source_table, locality_full_name
+FROM [dbo].[{table_name}]
+WHERE {_build_where_clause(selected_locations, selected_years)}
+GROUP BY [locality_full_name]
 """
 
 
 def _build_coordinate_query(selected_source, selected_locations=None, selected_years=None):
-    base_query = _build_map_union_query(selected_source)
-    if not base_query:
+    table_name = _map_table_name(selected_source)
+    if not table_name:
         return None
-
-    where_clauses = ["Latitude IS NOT NULL", "Longitude IS NOT NULL"]
-    if selected_locations:
-        values = ", ".join(_sql_literal(value) for value in selected_locations)
-        where_clauses.append(f"locality_full_name IN ({values})")
-    if selected_years:
-        values = ", ".join(_sql_literal(value) for value in selected_years)
-        where_clauses.append(f"Year IN ({values})")
+    available_columns = set(get_table_columns(table_name))
+    optional_selects = []
+    for column_name in OPTIONAL_MAP_COLUMNS:
+        if column_name in available_columns:
+            optional_selects.append(f"[{column_name}]")
+        else:
+            optional_selects.append(f"NULL AS [{column_name}]")
 
     return f"""
 SELECT
-    source_table,
-    locality_full_name,
-    Latitude,
-    Longitude,
-    Accession,
-    sample_id,
-    Year,
-    Site
-FROM (
-    {base_query}
-) q
-WHERE {' AND '.join(where_clauses)}
+    {_sql_literal(table_name)} AS [source_table],
+    [locality_full_name],
+    [Latitude],
+    [Longitude],
+    {', '.join(optional_selects)}
+FROM [dbo].[{table_name}]
+WHERE {_build_where_clause(selected_locations, selected_years)}
 """
 
 
 def _build_location_options_query(selected_source):
-    base_query = _build_map_union_query(selected_source)
-    if not base_query:
+    table_name = _map_table_name(selected_source)
+    if not table_name:
         return None
     return f"""
-SELECT DISTINCT locality_full_name
-FROM (
-    {base_query}
-) q
-WHERE locality_full_name IS NOT NULL AND Latitude IS NOT NULL AND Longitude IS NOT NULL
-ORDER BY locality_full_name
+SELECT DISTINCT [locality_full_name]
+FROM [dbo].[{table_name}]
+WHERE [locality_full_name] IS NOT NULL AND [Latitude] IS NOT NULL AND [Longitude] IS NOT NULL
+ORDER BY [locality_full_name]
 """
 
 
 def _build_year_options_query(selected_source):
-    base_query = _build_map_union_query(selected_source)
-    if not base_query:
+    table_name = _map_table_name(selected_source)
+    if not table_name or not _table_has_column("Year"):
         return None
     return f"""
-SELECT DISTINCT Year
-FROM (
-    {base_query}
-) q
-WHERE Year IS NOT NULL
-ORDER BY Year
+SELECT DISTINCT [Year]
+FROM [dbo].[{table_name}]
+WHERE [Year] IS NOT NULL
+ORDER BY [Year]
 """
 
 
 def _build_detail_query(source_table, locality_name=None, latitude=None, longitude=None):
-    safe_table = _sanitize_identifier(source_table)
+    safe_table = _map_table_name(source_table)
+    if not safe_table:
+        return None
     if locality_name is not None:
         locality_sql = _sql_literal(locality_name)
         return f"SELECT * FROM [dbo].[{safe_table}] WHERE [locality_full_name] = {locality_sql}"
@@ -241,16 +195,12 @@ def _build_detail_query(source_table, locality_name=None, latitude=None, longitu
 
 
 def _availability_panel(selected_source):
-    sources = _source_tables(selected_source)
+    table_name = _map_table_name(selected_source)
     rows = []
-    for source_table in sources:
-        try:
-            count_df = fetch_data_from_sql(f"SELECT COUNT(*) AS row_count FROM [dbo].[{_sanitize_identifier(source_table)}]")
-            row_count = int(count_df.iloc[0]["row_count"]) if count_df is not None and not count_df.empty else 0
-        except Exception:
-            logger.exception("Unable to count rows for map source %s", source_table)
-            row_count = 0
-        rows.append({"Dataset": source_table, "Rows": f"{row_count:,}"})
+    if table_name:
+        count_df = _safe_fetch(f"SELECT COUNT(*) AS row_count FROM [dbo].[{table_name}]")
+        row_count = int(count_df.iloc[0]["row_count"]) if not count_df.empty else 0
+        rows.append({"Dataset": table_name, "Rows": f"{row_count:,}"})
 
     note = "Uploaded tree datasets become visible here automatically when they are written into a mappable table."
     if dat_avail_table:
@@ -487,7 +437,7 @@ map_layout = dcc.Tab(
                                 dcc.Dropdown(
                                     id="map-source-dropdown",
                                     options=_initial_map_source_options(),
-                                    value="__all__",
+                                    value=_default_map_source_value(),
                                     clearable=False,
                                     persistence=True,
                                     persistence_type="session",
@@ -634,6 +584,52 @@ map_layout = dcc.Tab(
 
 
 @callback(
+    [
+        Output("map-source-dropdown", "value", allow_duplicate=True),
+        Output("map-location-filter", "value", allow_duplicate=True),
+        Output("map-year-filter", "value", allow_duplicate=True),
+        Output("search-id-type", "value", allow_duplicate=True),
+        Output("search-ids-input", "value", allow_duplicate=True),
+        Output("stored-click-data", "data", allow_duplicate=True),
+        Output("click-result-store", "data", allow_duplicate=True),
+        Output("search-result-store", "data", allow_duplicate=True),
+        Output("uploaded-tree-store", "data", allow_duplicate=True),
+        Output("map-coordinate-store", "data", allow_duplicate=True),
+        Output("map-viewport-store", "data", allow_duplicate=True),
+        Output("map-upload-status", "children", allow_duplicate=True),
+        Output("search-results-data", "children", allow_duplicate=True),
+        Output("individual-tree-data", "children", allow_duplicate=True),
+        Output("map-tree-upload", "contents", allow_duplicate=True),
+        Output("map-tree-upload", "filename", allow_duplicate=True),
+    ],
+    [Input("main-tabs", "value"), Input("reset-map", "n_clicks")],
+    prevent_initial_call=True,
+)
+def reset_tree_sites_state(active_tab, reset_clicks):
+    trigger_id = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else None
+    if trigger_id == "main-tabs" and active_tab == "map-tab":
+        raise PreventUpdate
+    return (
+        _default_map_source_value(),
+        [],
+        [],
+        SEARCH_ID_COLUMNS[0]["value"],
+        "",
+        None,
+        None,
+        None,
+        None,
+        None,
+        DEFAULT_MAP_VIEW,
+        html.Div(),
+        html.Div(),
+        html.Div("Select a site or individual tree to inspect details.", className="placeholder-card"),
+        None,
+        None,
+    )
+
+
+@callback(
     Output("map-source-dropdown", "options"),
     Input("map-source-dropdown", "id"),
 )
@@ -667,9 +663,8 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
     active_view = DEFAULT_MAP_VIEW if trigger_id == "reset-map" else (viewport or DEFAULT_MAP_VIEW)
     aggregate_query = _build_site_aggregate_query(selected_source, selected_locations, selected_years)
     try:
-        locations_df = fetch_data_from_sql(aggregate_query) if aggregate_query else pd.DataFrame()
+        locations_df = _safe_fetch(aggregate_query) if aggregate_query else pd.DataFrame()
     except Exception:
-        logger.exception("Unable to load map site aggregates")
         locations_df = pd.DataFrame()
 
     if locations_df is None:
@@ -680,11 +675,10 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
     coordinate_query = _build_coordinate_query(selected_source, selected_locations, selected_years)
     if coordinate_query:
         try:
-            coordinates_df = fetch_data_from_sql(coordinate_query)
+            coordinates_df = _safe_fetch(coordinate_query)
             if coordinates_df is not None and not coordinates_df.empty:
                 coordinate_records.extend(coordinates_df.to_dict("records"))
         except Exception:
-            logger.exception("Unable to load active map coordinates")
             coordinates_df = pd.DataFrame()
 
     if not locations_df.empty:
@@ -706,11 +700,11 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
                 lat=locations_df["avg_latitude"].tolist(),
                 marker={"size": sizes, "color": "#0b6b3a", "opacity": 0.92},
                 hovertext=[
-                    f"{row['locality_full_name']}<br>{row['source_table']}<br>{row['tree_count']} tree records"
+                    f"{row['locality_full_name']}<br>{row['tree_count']} tree records"
                     for _, row in locations_df.iterrows()
                 ],
                 hoverinfo="text",
-                customdata=locations_df[["source_table", "locality_full_name"]].values.tolist(),
+                customdata=[[map_table, row["locality_full_name"]] for _, row in locations_df.iterrows()],
                 name="Common Gardens",
             )
         )
@@ -839,12 +833,12 @@ def update_location_filter_options(selected_source, upload_data, current_values)
     query = _build_location_options_query(selected_source)
     if query:
         try:
-            df = fetch_data_from_sql(query)
+            df = _safe_fetch(query)
             if df is not None and not df.empty and "locality_full_name" in df.columns:
                 for value in df["locality_full_name"].dropna().tolist():
                     options_by_value[str(value)] = {"label": str(value), "value": value}
         except Exception:
-            logger.exception("Unable to load map location filter options")
+            pass
 
     upload_df = pd.DataFrame((upload_data or {}).get("records") or [])
     if not upload_df.empty and "locality_full_name" in upload_df.columns:
@@ -867,13 +861,13 @@ def update_year_filter_options(selected_source, upload_data, current_values):
     query = _build_year_options_query(selected_source)
     if query:
         try:
-            df = fetch_data_from_sql(query)
+            df = _safe_fetch(query)
             if df is not None and not df.empty and "Year" in df.columns:
                 for value in df["Year"].dropna().tolist():
                     label = str(int(value)) if isinstance(value, (int, float)) and float(value) == int(value) else str(value)
                     options_by_value[str(value)] = {"label": label, "value": value}
         except Exception:
-            logger.exception("Unable to load map year filter options")
+            pass
 
     upload_df = pd.DataFrame((upload_data or {}).get("records") or [])
     if not upload_df.empty and "Year" in upload_df.columns:
@@ -899,7 +893,6 @@ def update_availability_panel(selected_source, upload_data, selected_locations, 
     try:
         return _availability_panel_from_upload(selected_source or "__all__", upload_data, selected_locations, selected_years)
     except Exception:
-        logger.exception("Unable to render map availability panel")
         return html.Div(
             [
                 html.H6("Dataset Availability", className="section-title"),
@@ -910,7 +903,12 @@ def update_availability_panel(selected_source, upload_data, selected_locations, 
 
 
 @callback(
-    [Output("uploaded-tree-store", "data"), Output("map-upload-status", "children")],
+    [
+        Output("uploaded-tree-store", "data"),
+        Output("map-upload-status", "children"),
+        Output("map-tree-upload", "contents", allow_duplicate=True),
+        Output("map-tree-upload", "filename", allow_duplicate=True),
+    ],
     [Input("map-tree-upload", "contents"), Input("clear-map-upload-btn", "n_clicks")],
     State("map-tree-upload", "filename"),
     prevent_initial_call=True,
@@ -918,11 +916,11 @@ def update_availability_panel(selected_source, upload_data, selected_locations, 
 def handle_map_tree_upload(contents, clear_clicks, filename):
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else None
     if trigger == "clear-map-upload-btn":
-        return None, html.Div("Uploaded tree list cleared.", className="placeholder-card")
+        return None, html.Div("Uploaded tree list cleared.", className="placeholder-card"), None, None
 
     records, error = parse_uploaded_tree_file(contents, filename)
     if error:
-        return no_update, html.Div(error, className="warning-banner")
+        return no_update, html.Div(error, className="warning-banner"), no_update, no_update
 
     df = pd.DataFrame(records)
     preview = _make_table(df.head(MAX_UPLOAD_PREVIEW_ROWS), "map-upload-preview-table", page_size=MAX_UPLOAD_PREVIEW_ROWS)
@@ -935,6 +933,8 @@ def handle_map_tree_upload(contents, clear_clicks, filename):
             ],
             className="panel-card panel-card--compact",
         ),
+        no_update,
+        no_update,
     )
 
 
@@ -970,13 +970,15 @@ def display_click_data(click_data):
                     ],
                     className="panel-card",
                 ), None
-            df = fetch_data_from_sql(_build_detail_query(source_table, latitude=latitude, longitude=longitude))
+            detail_query = _build_detail_query(source_table, latitude=latitude, longitude=longitude)
+            df = _safe_fetch(detail_query) if detail_query else pd.DataFrame()
             header_text = f"{locality_name} tree record"
             summary = f"Source dataset: {source_table}"
             filename = f"{source_table}_tree_record.csv"
         else:
             source_table, locality_name = customdata
-            df = fetch_data_from_sql(_build_detail_query(source_table, locality_name=locality_name))
+            detail_query = _build_detail_query(source_table, locality_name=locality_name)
+            df = _safe_fetch(detail_query) if detail_query else pd.DataFrame()
             header_text = locality_name
             summary = f"{len(df):,} tree rows in {source_table}" if df is not None else source_table
             filename = f"{source_table}_{str(locality_name).replace(' ', '_')}.csv"
@@ -1004,7 +1006,6 @@ def display_click_data(click_data):
             store_data,
         )
     except Exception:
-        logger.exception("Unable to retrieve clicked map details")
         return html.Div("Details are unavailable for this selection.", className="placeholder-card"), None
 
 
@@ -1046,9 +1047,8 @@ FROM (
 ) q
 """
         try:
-            trees_df = fetch_data_from_sql(tree_query)
+            trees_df = _safe_fetch(tree_query)
         except Exception:
-            logger.exception("Unable to load individual trees for zoomed map")
             return no_update
         if trees_df is None:
             return no_update
@@ -1122,9 +1122,8 @@ FROM (
 WHERE [{id_type}] IN ({ids_sql})
 """
     try:
-        df = fetch_data_from_sql(search_query)
+        df = _safe_fetch(search_query)
     except Exception:
-        logger.exception("Tree search failed")
         return no_update, html.Div("Search is unavailable right now. Try a smaller dataset scope or try again later.", className="status-warning"), None
 
     if df is None or df.empty:

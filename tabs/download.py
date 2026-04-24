@@ -4,13 +4,12 @@ import dash
 from dash import dcc, html, Input, Output, State, callback, ctx
 from dash.exceptions import PreventUpdate
 from dash_ag_grid import AgGrid
+from database import fetch_data_from_sql
 from data_access import (
     DatabaseAccessError,
     fetch_table_rows,
     get_allowed_tables,
     get_column_distinct_values,
-    get_table_columns,
-    get_table_row_count,
 )
 from dotenv import load_dotenv
 
@@ -61,15 +60,29 @@ def _make_grid(df, grid_id):
         style={"width": "100%", "height": "360px"},
     )
 
+
+def _get_table_columns_direct(table_name):
+    df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{table_name}]")
+    if df is None:
+        raise DatabaseAccessError(f"Could not fetch columns from '{table_name}'.")
+    return df.columns.tolist()
+
+
+def _get_table_row_count_direct(table_name):
+    df = fetch_data_from_sql(f"SELECT COUNT(*) AS row_count FROM [dbo].[{table_name}]")
+    if df is None or df.empty:
+        raise DatabaseAccessError(f"Could not count rows for '{table_name}'.")
+    return int(df.iloc[0]["row_count"])
+
 download_layout = dcc.Tab(
     [
         # Store the tab's active state
         dcc.Store(id="download-tab-active", data=False),
         html.Div(
             [
-                html.H4("Flat Files", className="page-title"),
+                html.H4("Data Browser", className="page-title"),
                 html.P(
-                    "Use this browser when you need the original source tables. Choose a table, optionally narrow rows with dropdown filters, preview the data, then download the slice you need.",
+                    "View available tables.",
                     className="page-intro",
                 ),
             ],
@@ -80,7 +93,7 @@ download_layout = dcc.Tab(
             [
                 html.Div(
                     [
-                        html.H6("Open a Table", className="section-title"),
+                        html.H6("Choose a Table", className="section-title"),
                         dcc.Dropdown(table_options, id="download_table_dropdown", placeholder="Choose a source table"),
                         html.Div(id="download-row-info", className="section-copy"),
                     ],
@@ -110,8 +123,8 @@ download_layout = dcc.Tab(
                 ),
                 html.Div(
                     [
-                        html.H6("Categorical Filters", className="section-title"),
-                        html.P("Optional: choose a column and one or more values before refreshing the preview.", className="section-copy"),
+                        html.H6("Simple Filter", className="section-title"),
+                        html.P("Optional: choose one column and one or more values before refreshing the preview.", className="section-copy"),
                         dcc.Dropdown(id="download-filter-column", options=[], value=None, placeholder="Filter column"),
                         dcc.Dropdown(id="download-filter-values", options=[], value=[], multi=True, placeholder="Values"),
                     ],
@@ -149,7 +162,7 @@ download_layout = dcc.Tab(
                 html.Div(id="download-status"),
                 html.Div(
                     [
-                        html.H5("Preview", className="section-title"),
+                        html.H5("Preview Rows", className="section-title"),
                         html.Div(id="download-preview"),
                     ],
                     className="panel-card",
@@ -206,11 +219,13 @@ def show_download_container(selected_table):
     Input("download-tab-active", "data")
 )
 def render_table_overview(is_active):
+    if not is_active:
+        raise PreventUpdate
     cards = []
     for table in table_options:
         try:
-            row_count = get_table_row_count(table)
-            columns = get_table_columns(table)
+            row_count = _get_table_row_count_direct(table)
+            columns = _get_table_columns_direct(table)
             body = f"{row_count:,} rows · {len(columns):,} columns"
         except DatabaseAccessError as exc:
             logger.exception("Unable to summarize table %s", table)
@@ -224,7 +239,7 @@ def render_table_overview(is_active):
                 className="summary-card file-table-card",
             )
         )
-    return cards or html.Div("No source tables are configured.", className="placeholder-card")
+    return cards or html.Div("No source tables are configured for browsing.", className="placeholder-card")
 
 # Callback to get columns and row info
 @callback(
@@ -239,12 +254,12 @@ def update_column_options(selected_table):
         return [], [], "", 100
     
     try:
-        columns = get_table_columns(selected_table)
+        columns = _get_table_columns_direct(selected_table)
         column_options = [{'label': col, 'value': col} for col in columns]
         
-        total_rows = get_table_row_count(selected_table)
+        total_rows = _get_table_row_count_direct(selected_table)
         
-        row_info = f"{total_rows:,} rows available. By default, the preview is limited for speed; clear Limit rows to export the whole table."
+        row_info = f"{total_rows:,} rows available in this table. The preview only shows a small slice so the page stays fast."
         
         # Return all columns selected by default
         return column_options, columns, row_info, total_rows
@@ -280,7 +295,7 @@ def update_filter_column_options(selected_table):
     if not selected_table:
         return [], None
     try:
-        columns = get_table_columns(selected_table)
+        columns = _get_table_columns_direct(selected_table)
         return [{"label": column, "value": column} for column in columns], None
     except DatabaseAccessError:
         logger.exception("Unable to load filter columns for %s", selected_table)
@@ -395,7 +410,7 @@ def download_csv(n_clicks, selected_table, start_row, end_row, selected_columns,
     else:
         start_row = 1
         try:
-            row_count = get_table_row_count(selected_table)
+            row_count = _get_table_row_count_direct(selected_table)
         except DatabaseAccessError:
             logger.exception("Unable to count rows for %s before download", selected_table)
             return None, _friendly_error("Download unavailable")
