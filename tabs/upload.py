@@ -13,14 +13,19 @@ from data_access import (
     get_allowed_tables,
     get_table_columns,
     get_table_schema_preview,
+    get_table_display_name,
 )
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv(override=True)
 
-# Table Options
-table_options = get_allowed_tables()
+# Table Options - create options with descriptive labels
+_table_list = get_allowed_tables()
+table_options = [
+    {"label": get_table_display_name(table), "value": table}
+    for table in _table_list
+]
 logger = logging.getLogger(__name__)
 
 
@@ -137,10 +142,11 @@ upload_layout = dcc.Tab(
 # Track tab selection state
 @callback(
     Output('upload-tab-active', 'data'),
-    [Input('main-tabs', 'value')]
+    [Input('main-tabs', 'value'), Input('flat-files-subtabs', 'value')]
 )
-def set_upload_tab_active(tab_value):
-    return tab_value == 'upload-tab'
+def set_upload_tab_active(main_tab, sub_tab):
+    # Active if we are on the Flat Files tab AND the upload subtab is selected
+    return main_tab == 'flat-files-tab' and sub_tab == 'upload-subtab'
 
 # Reset when tab is switched
 @callback(

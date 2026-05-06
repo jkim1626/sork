@@ -4,7 +4,8 @@ from dash import dcc, html, Input, Output, State, callback, ctx, clientside_call
 from dash.exceptions import PreventUpdate
 import dash
 from dotenv import load_dotenv
-from database import fetch_data_from_sql
+from database import fetch_data_from_sql, fetch_data_from_sql_public
+from flask import session as flask_session
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from dash_ag_grid import AgGrid
@@ -31,6 +32,17 @@ stat_test_options = [
 # Load environment variables
 load_dotenv(override=True)
 logger = logging.getLogger(__name__)
+
+
+def _fetch_for_user(query, raise_on_error=False):
+    """Route DB query through the correct credential tier.
+
+    Authenticated users use the standard read role; guests use qplad_public.
+    """
+    if 'user' in flask_session:
+        return fetch_data_from_sql(query, raise_on_error=raise_on_error)
+    return fetch_data_from_sql_public(query, raise_on_error=raise_on_error)
+
 
 # ===== CONFIGURATION CONSTANTS =====
 
@@ -579,11 +591,11 @@ def get_column_lists_cached(metadata_store):
     # Fetch all column lists
     try:
         # Gardens table
-        gardens_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM dbo.[{GARDENS_TABLE}]")
+        gardens_df = _fetch_for_user(f"SELECT TOP 1 * FROM dbo.[{GARDENS_TABLE}]")
         gardens_cols = gardens_df.columns.tolist() if gardens_df is not None else []
         
         # Maternal tree table
-        tree_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM dbo.[{MATERNAL_TREE_TABLE}]")
+        tree_df = _fetch_for_user(f"SELECT TOP 1 * FROM dbo.[{MATERNAL_TREE_TABLE}]")
         tree_cols = tree_df.columns.tolist() if tree_df is not None else []
         
         return {
@@ -733,7 +745,7 @@ def update_core_table_columns(selected_table, metadata_store):
         MATERNAL_TREE_OPTIONS = [{'label': c, 'value': c} for c in tree_cols]
 
         # Fetch core table columns (not cached since it depends on selection)
-        sample_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
+        sample_df = _fetch_for_user(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
         if sample_df is None or sample_df.empty:
             error_msg = "Error: Could not fetch columns from selected table"
             return [], [], {"display": "none"}, [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg, [], [], {"display": "none"}
@@ -749,14 +761,14 @@ def update_core_table_columns(selected_table, metadata_store):
         try:
             # Get distinct years if Year column exists
             if "Year" in cols:
-                years_df = fetch_data_from_sql(f"SELECT DISTINCT [Year] FROM [dbo].[{selected_table}] WHERE [Year] IS NOT NULL ORDER BY [Year]")
+                years_df = _fetch_for_user(f"SELECT DISTINCT [Year] FROM [dbo].[{selected_table}] WHERE [Year] IS NOT NULL ORDER BY [Year]")
                 if years_df is not None and not years_df.empty:
                     year_values = sorted(years_df['Year'].dropna().unique())
                     year_options = [{"label": str(int(y)) if float(y) == int(y) else str(y), "value": y} for y in year_values]
             
             # Get distinct sites if Site column exists
             if "Site" in cols:
-                sites_df = fetch_data_from_sql(f"SELECT DISTINCT [Site] FROM [dbo].[{selected_table}] WHERE [Site] IS NOT NULL ORDER BY [Site]")
+                sites_df = _fetch_for_user(f"SELECT DISTINCT [Site] FROM [dbo].[{selected_table}] WHERE [Site] IS NOT NULL ORDER BY [Site]")
                 if sites_df is not None and not sites_df.empty:
                     site_values = sorted(sites_df['Site'].dropna().unique())
                     site_options = [{"label": str(s), "value": s} for s in site_values]
@@ -1114,7 +1126,7 @@ FROM (
 ) AS q
 """
 
-        result_df = fetch_data_from_sql(display_query)
+        result_df = _fetch_for_user(display_query)
 
         if result_df is None or result_df.empty:
             empty_div = html.Div("No results returned", style={"padding": "20px", "textAlign": "center", "color": "#666"})
@@ -1394,7 +1406,7 @@ def download_all_join_results(n_clicks, base_query, custom_filename):
     
     try:
         # Fetch all data from database using the stored query
-        df = fetch_data_from_sql(base_query)
+        df = _fetch_for_user(base_query)
         
         if df is None or df.empty:
             raise PreventUpdate
@@ -1528,7 +1540,7 @@ def clear_pca_warning(variables):
 # Analysis Helper
 def get_analysis_df(base_query, filter_model):
     query = f"SELECT TOP 50000 * FROM ({base_query}) q"
-    df = fetch_data_from_sql(query)
+    df = _fetch_for_user(query)
     if df is not None and not df.empty and filter_model:
         df = apply_filter_model(df, filter_model)
     return df

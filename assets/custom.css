@@ -653,3 +653,36 @@ button.login-button {
         display: none !important;
     }
 }
+
+/* ===== Guest banner (public access prompt) ===== */
+.guest-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: linear-gradient(135deg, #eef7f2 0%, #ddeee3 100%);
+    border: 1px solid rgba(47, 107, 69, 0.22);
+    border-radius: 8px;
+    padding: 10px 16px;
+    margin-top: 14px;
+    font-size: 0.9rem;
+    color: var(--shell-accent-dark);
+}
+
+/* ===== Column tooltip (reach goal: flat file downloads) ===== */
+.col-desc-tooltip {
+    display: inline-block;
+    margin-left: 5px;
+    font-size: 0.78rem;
+    color: var(--shell-muted);
+    cursor: help;
+    border-bottom: 1px dotted var(--shell-muted);
+}
+
+/* ===== Map data-filter panel ===== */
+.data-filter-panel {
+    background: #f4f8f2;
+    border: 1px solid rgba(47, 107, 69, 0.14);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin-bottom: 14px;
+}

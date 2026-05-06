@@ -1,10 +1,11 @@
-from dash import dcc, html, Dash
+from dash import dcc, html, Dash, callback, Input, Output, State
 from dash.dependencies import Input, Output
 from tabs.upload import upload_layout
 from tabs.download import download_layout
 from tabs.map import map_layout
 from tabs.joins import joins_layout
 from components.shell import build_app_bar, build_content_frame, build_footer, build_tabs
+import copy
 import os
 import secrets
 from dotenv import load_dotenv
@@ -94,11 +95,45 @@ app.index_string = '''
 </html>
 '''
 
+# Create a combined "Flat File Downloads" tab with upload and download as sub-tabs
+flat_files_layout = dcc.Tab(
+    [
+        dcc.Tabs(
+            id="flat-files-subtabs",
+            value="download-subtab",
+            children=[
+                dcc.Tab(
+                    download_layout.children,
+                    label="Download/Browse",
+                    id="download-subtab",
+                    style={"padding": "15px"}
+                ),
+                dcc.Tab(
+                    upload_layout.children,
+                    label="Upload",
+                    id="upload-subtab",
+                    style={"padding": "15px"}
+                ),
+            ],
+            style={"display": "flex", "flex": "1 1 auto", "flexDirection": "column"},
+            parent_style={"display": "flex", "flex": "1 1 auto", "flexDirection": "column"},
+        )
+    ],
+    label="Flat File Downloads",
+    id="flat-files-tab",
+    style={"padding": "15px", "display": "flex", "flexDirection": "column", "flex": "1 1 auto", "minHeight": 0}
+)
+
 TAB_SPECS = [
     ("Select and Filter", joins_layout),
     ("Tree Sites", map_layout),
-    ("Upload", upload_layout),
-    ("Files", download_layout),
+    ("Flat File Downloads", flat_files_layout),
+]
+
+# Guest-facing tab set — Select & Filter and Map only (no uploads, no flat file downloads)
+GUEST_TAB_SPECS = [
+    ("Select and Filter", joins_layout),
+    ("Tree Sites", map_layout),
 ]
 
 
@@ -173,37 +208,41 @@ def build_guest_layout():
                 className="app-shell__body",
                 children=[
                     build_content_frame(
-                        html.Div(
-                            className="login-panel",
-                            children=[
-                                html.P("Protected access", className="content-frame__eyebrow"),
-                                html.H2("Welcome to Sork Lab Dashboard", className="content-frame__title"),
-                                html.P(
-                                    "Log in to work with the full dashboard. The map preview below remains visible for quick public browsing.",
-                                    className="content-frame__subtitle",
-                                ),
-                                html.Div(id='error-message', className="login-panel__error"),
-                                html.A(
-                                    html.Button("Login", className="btn btn-primary login-button"),
-                                    href="/login",
-                                    className="login-panel__action",
-                                ),
-                            ],
-                        ),
-                        class_name="content-frame--narrow",
-                    ),
-                    build_content_frame(
                         [
                             html.Div(
                                 className="content-frame__header",
                                 children=[
-                                    html.P("Preview", className="content-frame__eyebrow"),
-                                    html.H2("Tree Sites", className="content-frame__title"),
+                                    html.Div(
+                                        [
+                                            html.P("Public Access", className="content-frame__eyebrow"),
+                                            html.H2("Shared data tools", className="content-frame__title"),
+                                            html.P(
+                                                "Browse and filter data without an account. Log in for upload access and flat-file downloads.",
+                                                className="content-frame__subtitle",
+                                            ),
+                                        ]
+                                    ),
+                                    # Non-blocking login prompt banner
+                                    html.Div(
+                                        [
+                                            html.Span(
+                                                "🔒 Log in for full access — uploads and flat-file downloads require authentication.",
+                                                style={"flex": "1"},
+                                            ),
+                                            html.A(
+                                                html.Button("Login", className="btn btn-primary btn-sm"),
+                                                href="/login",
+                                                style={"marginLeft": "12px"},
+                                            ),
+                                        ],
+                                        className="guest-banner",
+                                    ),
+                                    html.Div(id='error-message', className="login-panel__error"),
                                 ],
                             ),
-                            map_layout,
+                            build_tabs(GUEST_TAB_SPECS, tabs_id='main-tabs', active_value='joins-tab'),
                         ]
-                    ),
+                    )
                 ],
             ),
             build_footer("Sork Lab Dashboard © 2025"),

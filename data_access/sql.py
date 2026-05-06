@@ -1,29 +1,50 @@
+import logging
 import os
 import re
 
 import pandas as pd
 from dotenv import load_dotenv
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 load_dotenv(override=True)
+
+logger = logging.getLogger(__name__)
+
+
+# Mapping of table names to descriptive labels
+TABLE_DESCRIPTIONS = {
+    "db_main": "Growth/Survival Data",
+    "budburst_date1": "Budburst Dates",
+    "budburst_detailed_all": "All Budburst Stages",
+    "biomass_2021_combined_fordb_052224": "Biomass 2021",
+    "leaf_traits_2016": "Leaf Traits 2016",
+    "dat_climdb": "Climate Database",
+    "dat_cgp_db": "Common Garden Phenotypes",
+    "dat_avail_db": "Data Availability Metadata",
+}
 
 
 class DatabaseAccessError(Exception):
     """Raised when a database operation cannot be completed safely."""
 
 
+def get_table_display_name(table_name):
+    """Get the descriptive display name for a table."""
+    return TABLE_DESCRIPTIONS.get(table_name, table_name)
+
+
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_ ]*$")
 
 
-def _build_connection_string():
+def _build_connection_string(server_var="DB_SERVER", db_var="DB_DATABASE", user_var="DB_USERNAME", pass_var="DB_PASSWORD"):
     driver = "ODBC Driver 17 for SQL Server"
-    server = os.getenv("DB_SERVER")
-    database = os.getenv("DB_DATABASE")
-    username = os.getenv("DB_USERNAME")
-    password = os.getenv("DB_PASSWORD")
+    server = os.getenv(server_var)
+    database = os.getenv(db_var)
+    username = os.getenv(user_var)
+    password = os.getenv(pass_var)
 
     if not all([server, database, username, password]):
-        raise DatabaseAccessError("Missing one or more database environment variables.")
+        raise DatabaseAccessError(f"Missing one or more database environment variables for {server_var}.")
 
     return (
         f"mssql+pyodbc://{username}:{password}@{server}/{database}"
@@ -31,9 +52,52 @@ def _build_connection_string():
     )
 
 
-def get_engine():
+def _public_creds_configured():
+    """Return True only if all four DB_PUBLIC_* env vars are set and non-placeholder."""
+    for var in ("DB_PUBLIC_SERVER", "DB_PUBLIC_DATABASE", "DB_PUBLIC_USERNAME", "DB_PUBLIC_PASSWORD"):
+        val = os.getenv(var, "")
+        if not val or "_here" in val or val.lower() in ("none", ""):
+            return False
+    return True
+
+
+def get_engine(connection_type="read"):
+    """Get SQLAlchemy engine for specified connection type.
+
+    connection_type: 'read', 'upload', or 'public'.
+
+    If connection_type is 'public' but the DB_PUBLIC_* env vars are not
+    configured yet, the function falls back to the standard read engine and
+    logs a warning rather than crashing.
+    """
+    if connection_type == "upload":
+        connection_string = _build_connection_string(
+            server_var="DB_UPLOAD_SERVER",
+            db_var="DB_UPLOAD_DATABASE",
+            user_var="DB_UPLOAD_USERNAME",
+            pass_var="DB_UPLOAD_PASSWORD"
+        )
+    elif connection_type == "public":
+        if _public_creds_configured():
+            connection_string = _build_connection_string(
+                server_var="DB_PUBLIC_SERVER",
+                db_var="DB_PUBLIC_DATABASE",
+                user_var="DB_PUBLIC_USERNAME",
+                pass_var="DB_PUBLIC_PASSWORD"
+            )
+        else:
+            logger.warning(
+                "DB_PUBLIC_* credentials are not configured. "
+                "Falling back to the read engine for public queries. "
+                "Set DB_PUBLIC_SERVER / DB_PUBLIC_DATABASE / DB_PUBLIC_USERNAME / "
+                "DB_PUBLIC_PASSWORD in .env to use the dedicated qplad_public role."
+            )
+            connection_string = _build_connection_string()
+    else:  # read (default)
+        connection_string = _build_connection_string()
+
     return create_engine(
-        _build_connection_string(),
+        connection_string,
         fast_executemany=True,
         pool_pre_ping=True,
     )
@@ -56,10 +120,14 @@ def _validate_table_name(table_name):
     return table_name
 
 
-def fetch_query_dataframe(query):
+def fetch_query_dataframe(query, connection_type="read"):
+    """Execute a query and return a DataFrame.
+
+    connection_type: 'read' (default authenticated), 'upload', or 'public'.
+    """
     engine = None
     try:
-        engine = get_engine()
+        engine = get_engine(connection_type)
         with engine.connect() as connection:
             return pd.read_sql_query(query, connection)
     except DatabaseAccessError:
@@ -71,14 +139,19 @@ def fetch_query_dataframe(query):
             engine.dispose()
 
 
+def fetch_query_dataframe_public(query):
+    """Execute a query using the qplad_public role (unauthenticated users)."""
+    return fetch_query_dataframe(query, connection_type="public")
+
+
 def get_table_columns(table_name):
     validated_table = _validate_table_name(table_name)
-    query = """
+    query = text("""
     SELECT COLUMN_NAME
     FROM INFORMATION_SCHEMA.COLUMNS
     WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = :table_name
     ORDER BY ORDINAL_POSITION
-    """
+    """)
     engine = None
     try:
         engine = get_engine()
@@ -210,7 +283,7 @@ def append_dataframe_to_table(table_name, df):
 
     engine = None
     try:
-        engine = get_engine()
+        engine = get_engine("upload")  # Use upload credentials for INSERT operations
         with engine.begin() as connection:
             upload_df.to_sql(validated_table, connection, if_exists="append", index=False, schema="dbo")
     except Exception as exc:

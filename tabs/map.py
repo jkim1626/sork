@@ -46,6 +46,17 @@ UCLA_COORDINATES = {
     "longitude": -118.4455,
 }
 
+# Known common garden sites (static reference layer, always visible).
+# TODO: update lat/lon values to match the actual Sork lab site coordinates.
+COMMON_GARDEN_SITES = {
+    "Chico": {"latitude": 39.73, "longitude": -121.84},
+    "Placerville": {"latitude": 38.73, "longitude": -120.80},
+    "Hopland": {"latitude": 39.00, "longitude": -123.07},
+    "McLaughlin": {"latitude": 38.87, "longitude": -122.43},
+    "Sierra Foothill": {"latitude": 39.24, "longitude": -121.29},
+    "Riverside": {"latitude": 33.97, "longitude": -117.33},
+}
+
 
 def _sanitize_identifier(name):
     if not name or not re.fullmatch(r"[\w \-()./]+", name):
@@ -99,28 +110,38 @@ def _safe_fetch(query):
     return df
 
 
-def _table_has_column(column_name):
-    table_name = _map_table_name()
+def _table_has_column(table_name, column_name):
     if not table_name:
         return False
     return column_name in set(get_table_columns(table_name))
 
 
-def _build_where_clause(selected_locations=None, selected_years=None):
+def _build_where_clause(table_name, selected_locations=None, selected_years=None, data_filter_col=None, data_filter_val=None):
     clauses = ["[Latitude] IS NOT NULL", "[Longitude] IS NOT NULL"]
     if selected_locations:
         values = ", ".join(_sql_literal(value) for value in selected_locations)
         clauses.append(f"[locality_full_name] IN ({values})")
-    if selected_years and _table_has_column("Year"):
+    if selected_years and _table_has_column(table_name, "Year"):
         values = ", ".join(_sql_literal(value) for value in selected_years)
         clauses.append(f"[Year] IN ({values})")
+    if data_filter_col and data_filter_val is not None and data_filter_val != "" and _table_has_column(table_name, data_filter_col):
+        clauses.append(f"[{data_filter_col}] = {_sql_literal(data_filter_val)}")
     return " AND ".join(clauses)
 
 
-def _build_site_aggregate_query(selected_source, selected_locations=None, selected_years=None):
+def _build_site_aggregate_query(selected_source, selected_locations=None, selected_years=None, data_filter_col=None, data_filter_val=None):
     table_name = _map_table_name(selected_source)
     if not table_name:
         return None
+    
+    where_clause = _build_where_clause(table_name, selected_locations, selected_years, data_filter_col, data_filter_val)
+    
+    # If the table is dat_avail_db and a year filter is applied, we must check db_main
+    if table_name == "dat_avail_db" and selected_years and not _table_has_column(table_name, "Year"):
+        where_clause_no_year = _build_where_clause(table_name, selected_locations, None, data_filter_col, data_filter_val)
+        years_list = ", ".join(_sql_literal(y) for y in selected_years)
+        where_clause = f"{where_clause_no_year} AND EXISTS (SELECT 1 FROM [dbo].[db_main] d WHERE d.[Locality] = [dbo].[{table_name}].[Locality] AND d.[Year] IN ({years_list}))"
+
     return f"""
 SELECT
     [locality_full_name],
@@ -128,12 +149,12 @@ SELECT
     AVG([Latitude]) AS avg_latitude,
     COUNT(*) AS tree_count
 FROM [dbo].[{table_name}]
-WHERE {_build_where_clause(selected_locations, selected_years)}
+WHERE {where_clause}
 GROUP BY [locality_full_name]
 """
 
 
-def _build_coordinate_query(selected_source, selected_locations=None, selected_years=None):
+def _build_coordinate_query(selected_source, selected_locations=None, selected_years=None, data_filter_col=None, data_filter_val=None):
     table_name = _map_table_name(selected_source)
     if not table_name:
         return None
@@ -144,6 +165,14 @@ def _build_coordinate_query(selected_source, selected_locations=None, selected_y
             optional_selects.append(f"[{column_name}]")
         else:
             optional_selects.append(f"NULL AS [{column_name}]")
+            
+    where_clause = _build_where_clause(table_name, selected_locations, selected_years, data_filter_col, data_filter_val)
+    
+    # If the table is dat_avail_db and a year filter is applied, we must check db_main
+    if table_name == "dat_avail_db" and selected_years and not _table_has_column(table_name, "Year"):
+        where_clause_no_year = _build_where_clause(table_name, selected_locations, None, data_filter_col, data_filter_val)
+        years_list = ", ".join(_sql_literal(y) for y in selected_years)
+        where_clause = f"{where_clause_no_year} AND EXISTS (SELECT 1 FROM [dbo].[db_main] d WHERE d.[Locality] = [dbo].[{table_name}].[Locality] AND d.[Year] IN ({years_list}))"
 
     return f"""
 SELECT
@@ -153,32 +182,49 @@ SELECT
     [Longitude],
     {', '.join(optional_selects)}
 FROM [dbo].[{table_name}]
-WHERE {_build_where_clause(selected_locations, selected_years)}
+WHERE {where_clause}
 """
 
 
-def _build_location_options_query(selected_source):
+def _build_location_options_query(selected_source, data_filter_col=None, data_filter_val=None):
     table_name = _map_table_name(selected_source)
     if not table_name:
         return None
+    base_where = "[locality_full_name] IS NOT NULL AND [Latitude] IS NOT NULL AND [Longitude] IS NOT NULL"
+    if data_filter_col and data_filter_val is not None and data_filter_val != "" and _table_has_column(data_filter_col):
+        base_where += f" AND [{data_filter_col}] = {_sql_literal(data_filter_val)}"
     return f"""
 SELECT DISTINCT [locality_full_name]
 FROM [dbo].[{table_name}]
-WHERE [locality_full_name] IS NOT NULL AND [Latitude] IS NOT NULL AND [Longitude] IS NOT NULL
+WHERE {base_where}
 ORDER BY [locality_full_name]
 """
 
 
-def _build_year_options_query(selected_source):
+def _build_year_options_query(selected_source, selected_locations=None):
     table_name = _map_table_name(selected_source)
-    if not table_name or not _table_has_column("Year"):
+    if not table_name:
         return None
-    return f"""
-SELECT DISTINCT [Year]
-FROM [dbo].[{table_name}]
-WHERE [Year] IS NOT NULL
-ORDER BY [Year]
-"""
+        
+    if _table_has_column(table_name, "Year"):
+        where_clause = _build_where_clause(table_name, selected_locations=selected_locations)
+        return f"""
+    SELECT DISTINCT [Year]
+    FROM [dbo].[{table_name}]
+    WHERE [Year] IS NOT NULL AND {where_clause}
+    ORDER BY [Year]
+    """
+    elif table_name == "dat_avail_db" and _table_has_column("db_main", "Year"):
+        where_clause = _build_where_clause(table_name, selected_locations=selected_locations)
+        where_clause = where_clause.replace("[Latitude]", "a.[Latitude]").replace("[Longitude]", "a.[Longitude]").replace("[locality_full_name]", "a.[locality_full_name]")
+        return f"""
+    SELECT DISTINCT d.[Year]
+    FROM [dbo].[db_main] d
+    JOIN [dbo].[{table_name}] a ON d.[Locality] = a.[Locality]
+    WHERE d.[Year] IS NOT NULL AND {where_clause}
+    ORDER BY d.[Year]
+    """
+    return None
 
 
 def _build_detail_query(source_table, locality_name=None, latitude=None, longitude=None):
@@ -462,8 +508,40 @@ map_layout = dcc.Tab(
                                     persistence=True,
                                     persistence_type="session",
                                 ),
+                                # Data Availability Filter
                                 html.Div(
-                                    f"Choose a dataset first if filters are empty. Common gardens are green, UCLA is gold, individual trees are red after zoom {INDIVIDUAL_TREE_ZOOM_THRESHOLD}, uploaded trees are blue, and search hits are purple.",
+                                    [
+                                        html.H6("Data Availability Filter", className="section-title", style={"marginTop": "10px"}),
+                                        html.P(
+                                            "Show only map points where a specific column equals a given value (e.g. planted_in_common_garden = 1).",
+                                            className="section-copy",
+                                            style={"fontSize": "0.85em"},
+                                        ),
+                                        html.Label("Filter column", className="control-label"),
+                                        dcc.Dropdown(
+                                            id="map-data-filter-col",
+                                            options=[],
+                                            value=None,
+                                            placeholder="No column filter",
+                                            clearable=True,
+                                            persistence=True,
+                                            persistence_type="session",
+                                        ),
+                                        html.Label("Must equal", className="control-label"),
+                                        dcc.Dropdown(
+                                            id="map-data-filter-val",
+                                            options=[],
+                                            value=None,
+                                            placeholder="Select a value",
+                                            clearable=True,
+                                            persistence=True,
+                                            persistence_type="session",
+                                        ),
+                                    ],
+                                    className="data-filter-panel",
+                                ),
+                                html.Div(
+                                    f"Common garden reference sites are shown as teal diamonds. Choose a dataset first if filters are empty. Green circles = data sites, gold = UCLA, red = individual trees (zoom {INDIVIDUAL_TREE_ZOOM_THRESHOLD}+), blue = uploaded, purple = search hits.",
                                     className="info-banner",
                                 ),
                                 html.Div(
@@ -553,7 +631,8 @@ map_layout = dcc.Tab(
                     [
                         html.Div(
                             [
-                                _summary_card("Common Gardens", "Clustered statewide view", "#2d6a4f"),
+                                _summary_card("Data Sites", "Clustered from dataset", "#2d6a4f"),
+                                _summary_card("Known Gardens", "Reference sites (always visible)", "#0d9488"),
                                 _summary_card("UCLA", "Always highlighted", "#e0a800"),
                                 _summary_card("Individual Trees", f"Shown from zoom {INDIVIDUAL_TREE_ZOOM_THRESHOLD}", TREE_MARKER_COLOR),
                                 _summary_card("Uploaded Trees", "Added from tree lists", "#0d6efd"),
@@ -588,6 +667,8 @@ map_layout = dcc.Tab(
         Output("map-source-dropdown", "value", allow_duplicate=True),
         Output("map-location-filter", "value", allow_duplicate=True),
         Output("map-year-filter", "value", allow_duplicate=True),
+        Output("map-data-filter-col", "value", allow_duplicate=True),
+        Output("map-data-filter-val", "value", allow_duplicate=True),
         Output("search-id-type", "value", allow_duplicate=True),
         Output("search-ids-input", "value", allow_duplicate=True),
         Output("stored-click-data", "data", allow_duplicate=True),
@@ -613,6 +694,8 @@ def reset_tree_sites_state(active_tab, reset_clicks):
         _default_map_source_value(),
         [],
         [],
+        None,
+        None,
         SEARCH_ID_COLUMNS[0]["value"],
         "",
         None,
@@ -650,10 +733,12 @@ def hydrate_map_source_options(_dropdown_id):
         Input("map-year-filter", "value"),
         Input("uploaded-tree-store", "data"),
         Input("california-map", "clickData"),
+        Input("map-data-filter-col", "value"),
+        Input("map-data-filter-val", "value"),
     ],
     State("map-viewport-store", "data"),
 )
-def update_map_and_click_data(reset_clicks, selected_source, selected_locations, selected_years, upload_data, click_data, viewport):
+def update_map_and_click_data(reset_clicks, selected_source, selected_locations, selected_years, upload_data, click_data, data_filter_col, data_filter_val, viewport):
     trigger_id = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else None
 
     if trigger_id == "california-map":
@@ -661,7 +746,7 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
 
     fig = go.Figure()
     active_view = DEFAULT_MAP_VIEW if trigger_id == "reset-map" else (viewport or DEFAULT_MAP_VIEW)
-    aggregate_query = _build_site_aggregate_query(selected_source, selected_locations, selected_years)
+    aggregate_query = _build_site_aggregate_query(selected_source, selected_locations, selected_years, data_filter_col, data_filter_val)
     try:
         locations_df = _safe_fetch(aggregate_query) if aggregate_query else pd.DataFrame()
     except Exception:
@@ -672,7 +757,7 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
 
     coordinate_records = []
     coordinates_df = pd.DataFrame()
-    coordinate_query = _build_coordinate_query(selected_source, selected_locations, selected_years)
+    coordinate_query = _build_coordinate_query(selected_source, selected_locations, selected_years, data_filter_col, data_filter_val)
     if coordinate_query:
         try:
             coordinates_df = _safe_fetch(coordinate_query)
@@ -720,6 +805,21 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
             hovertext=["University of California, Los Angeles (UCLA)"],
             hoverinfo="text",
             name="UCLA",
+        )
+    )
+    # Static common garden reference layer (trace index 2 — always visible)
+    garden_lons = [v["longitude"] for v in COMMON_GARDEN_SITES.values()]
+    garden_lats = [v["latitude"] for v in COMMON_GARDEN_SITES.values()]
+    garden_names = list(COMMON_GARDEN_SITES.keys())
+    fig.add_trace(
+        go.Scattermapbox(
+            mode="markers",
+            lon=garden_lons,
+            lat=garden_lats,
+            marker={"size": 22, "color": "#0d9488", "opacity": 0.95, "symbol": "circle"},
+            hovertext=[f"<b>{name}</b><br>Known common garden site" for name in garden_names],
+            hoverinfo="text",
+            name="Known Garden Sites",
         )
     )
     show_tree_layer = active_view.get("zoom", DEFAULT_MAP_VIEW["zoom"]) >= INDIVIDUAL_TREE_ZOOM_THRESHOLD
@@ -853,12 +953,12 @@ def update_location_filter_options(selected_source, upload_data, current_values)
 
 @callback(
     [Output("map-year-filter", "options"), Output("map-year-filter", "value")],
-    [Input("map-source-dropdown", "value"), Input("uploaded-tree-store", "data")],
+    [Input("map-source-dropdown", "value"), Input("map-location-filter", "value"), Input("uploaded-tree-store", "data")],
     State("map-year-filter", "value"),
 )
-def update_year_filter_options(selected_source, upload_data, current_values):
+def update_year_filter_options(selected_source, selected_locations, upload_data, current_values):
     options_by_value = {}
-    query = _build_year_options_query(selected_source)
+    query = _build_year_options_query(selected_source, selected_locations)
     if query:
         try:
             df = _safe_fetch(query)
@@ -871,6 +971,8 @@ def update_year_filter_options(selected_source, upload_data, current_values):
 
     upload_df = pd.DataFrame((upload_data or {}).get("records") or [])
     if not upload_df.empty and "Year" in upload_df.columns:
+        if selected_locations and "locality_full_name" in upload_df.columns:
+            upload_df = upload_df[upload_df["locality_full_name"].astype(str).isin([str(v) for v in selected_locations])]
         for value in upload_df["Year"].dropna().unique().tolist():
             options_by_value[str(value)] = {"label": f"{value} (uploaded)", "value": value}
 
@@ -879,6 +981,52 @@ def update_year_filter_options(selected_source, upload_data, current_values):
     selected = [value for value in (current_values or []) if str(value) in valid_keys]
     return options, selected
 
+
+@callback(
+    Output("map-data-filter-col", "options"),
+    Input("map-source-dropdown", "value"),
+)
+def update_data_filter_columns(selected_source):
+    """Populate the data-availability filter column dropdown from the map table."""
+    table_name = _map_table_name(selected_source)
+    if not table_name:
+        return []
+    try:
+        cols = get_table_columns(table_name)
+        # Exclude coordinate / name columns that aren’t useful as filters
+        skip = {"Latitude", "Longitude", "locality_full_name"}
+        return [{"label": c, "value": c} for c in cols if c not in skip]
+    except Exception:
+        return []
+
+
+@callback(
+    [Output("map-data-filter-val", "options"), Output("map-data-filter-val", "value")],
+    [Input("map-source-dropdown", "value"), Input("map-data-filter-col", "value")],
+    prevent_initial_call=True,
+)
+def update_data_filter_values(selected_source, filter_col):
+    """Populate the value dropdown with distinct values for the selected filter column."""
+    if not filter_col:
+        return [], None
+    table_name = _map_table_name(selected_source)
+    if not table_name:
+        return [], None
+    try:
+        query = f"""
+        SELECT DISTINCT TOP 200 [{filter_col}]
+        FROM [dbo].[{table_name}]
+        WHERE [{filter_col}] IS NOT NULL
+        ORDER BY [{filter_col}]
+        """
+        df = _safe_fetch(query)
+        if df is None or df.empty:
+            return [], None
+        values = df.iloc[:, 0].tolist()
+        options = [{"label": str(v), "value": v} for v in values]
+        return options, None
+    except Exception:
+        return [], None
 
 @callback(
     Output("map-availability-panel", "children"),
@@ -960,7 +1108,24 @@ def display_click_data(click_data):
                 className="panel-card",
             ), None
 
-        if curve in (2, 4):
+        if curve == 2:
+            # Known Garden Sites static layer — no DB query needed
+            name = next((k for k, v in COMMON_GARDEN_SITES.items()), "Known common garden site")
+            site_name = (customdata or [None])[0] if customdata else None
+            display_name = str(site_name) if site_name else "Known common garden site"
+            return html.Div(
+                [
+                    _summary_card("Common Garden Site", display_name, "#0d9488"),
+                    html.P(
+                        "This is a known common garden reference site. Coordinates are hardcoded in the app. "
+                        "Contact the lab manager to update them.",
+                        className="section-copy",
+                    ),
+                ],
+                className="panel-card",
+            ), None
+
+        if curve in (3, 5):  # Individual Trees (3) or Uploaded Trees (5)
             source_table, latitude, longitude, locality_name = customdata
             if source_table == "Uploaded tree list":
                 return html.Div(
@@ -1016,10 +1181,12 @@ def display_click_data(click_data):
         State("map-source-dropdown", "value"),
         State("map-location-filter", "value"),
         State("map-year-filter", "value"),
+        State("map-data-filter-col", "value"),
+        State("map-data-filter-val", "value"),
     ],
     prevent_initial_call=True,
 )
-def toggle_individual_trees(relayout_data, selected_source, selected_locations, selected_years):
+def toggle_individual_trees(relayout_data, selected_source, selected_locations, selected_years, data_filter_col, data_filter_val):
     if not relayout_data:
         return no_update
 
@@ -1031,7 +1198,7 @@ def toggle_individual_trees(relayout_data, selected_source, selected_locations, 
     patched_fig = Patch()
 
     if zoom >= INDIVIDUAL_TREE_ZOOM_THRESHOLD:
-        tree_query = _build_coordinate_query(selected_source, selected_locations, selected_years)
+        tree_query = _build_coordinate_query(selected_source, selected_locations, selected_years, data_filter_col, data_filter_val)
         if not tree_query:
             return no_update
         tree_query = f"""
@@ -1053,23 +1220,23 @@ FROM (
         if trees_df is None:
             return no_update
 
-        patched_fig["data"][2]["lat"] = trees_df["Latitude"].tolist()
-        patched_fig["data"][2]["lon"] = trees_df["Longitude"].tolist()
-        patched_fig["data"][2]["marker"]["size"] = 15
-        patched_fig["data"][2]["marker"]["color"] = TREE_MARKER_COLOR
-        patched_fig["data"][2]["marker"]["opacity"] = 0.97
-        patched_fig["data"][2]["hovertext"] = [
+        patched_fig["data"][3]["lat"] = trees_df["Latitude"].tolist()
+        patched_fig["data"][3]["lon"] = trees_df["Longitude"].tolist()
+        patched_fig["data"][3]["marker"]["size"] = 15
+        patched_fig["data"][3]["marker"]["color"] = TREE_MARKER_COLOR
+        patched_fig["data"][3]["marker"]["opacity"] = 0.97
+        patched_fig["data"][3]["hovertext"] = [
             f"Tree: {_tree_label(row)}<br>{row['source_table']}<br>Accession: {row.get('Accession', '')}<br>Sample ID: {row.get('sample_id', '')}"
             for _, row in trees_df.iterrows()
         ]
-        patched_fig["data"][2]["customdata"] = trees_df[
+        patched_fig["data"][3]["customdata"] = trees_df[
             ["source_table", "Latitude", "Longitude", "locality_full_name"]
         ].values.tolist()
     else:
-        patched_fig["data"][2]["lat"] = []
-        patched_fig["data"][2]["lon"] = []
-        patched_fig["data"][2]["hovertext"] = []
-        patched_fig["data"][2]["customdata"] = []
+        patched_fig["data"][3]["lat"] = []
+        patched_fig["data"][3]["lon"] = []
+        patched_fig["data"][3]["hovertext"] = []
+        patched_fig["data"][3]["customdata"] = []
 
     return patched_fig
 
@@ -1095,10 +1262,10 @@ def search_trees(search_clicks, clear_clicks, input_text, id_type, selected_sour
     patched_fig = Patch()
 
     if trigger == "clear-search-btn":
-        patched_fig["data"][3]["lat"] = []
-        patched_fig["data"][3]["lon"] = []
-        patched_fig["data"][3]["hovertext"] = []
-        patched_fig["data"][3]["customdata"] = []
+        patched_fig["data"][4]["lat"] = []
+        patched_fig["data"][4]["lon"] = []
+        patched_fig["data"][4]["hovertext"] = []
+        patched_fig["data"][4]["customdata"] = []
         return patched_fig, html.Div("Search results cleared.", className="placeholder-card"), None
 
     if not input_text or not input_text.strip():
@@ -1127,23 +1294,23 @@ WHERE [{id_type}] IN ({ids_sql})
         return no_update, html.Div("Search is unavailable right now. Try a smaller dataset scope or try again later.", className="status-warning"), None
 
     if df is None or df.empty:
-        patched_fig["data"][3]["lat"] = []
-        patched_fig["data"][3]["lon"] = []
-        patched_fig["data"][3]["hovertext"] = []
-        patched_fig["data"][3]["customdata"] = []
+        patched_fig["data"][4]["lat"] = []
+        patched_fig["data"][4]["lon"] = []
+        patched_fig["data"][4]["hovertext"] = []
+        patched_fig["data"][4]["customdata"] = []
         return patched_fig, html.Div("No matching trees were found.", className="placeholder-card"), None
 
     map_df = df.dropna(subset=["Latitude", "Longitude"])
-    patched_fig["data"][3]["lat"] = map_df["Latitude"].tolist()
-    patched_fig["data"][3]["lon"] = map_df["Longitude"].tolist()
-    patched_fig["data"][3]["marker"]["size"] = 19
-    patched_fig["data"][3]["marker"]["color"] = "#6d28d9"
-    patched_fig["data"][3]["marker"]["opacity"] = 0.96
-    patched_fig["data"][3]["hovertext"] = [
+    patched_fig["data"][4]["lat"] = map_df["Latitude"].tolist()
+    patched_fig["data"][4]["lon"] = map_df["Longitude"].tolist()
+    patched_fig["data"][4]["marker"]["size"] = 19
+    patched_fig["data"][4]["marker"]["color"] = "#6d28d9"
+    patched_fig["data"][4]["marker"]["opacity"] = 0.96
+    patched_fig["data"][4]["hovertext"] = [
         f"{row['locality_full_name']}<br>{row['source_table']}<br>{id_type}: {row.get(id_type, '')}"
         for _, row in map_df.iterrows()
     ]
-    patched_fig["data"][3]["customdata"] = map_df[["source_table", "locality_full_name"]].values.tolist()
+    patched_fig["data"][4]["customdata"] = map_df[["source_table", "locality_full_name"]].values.tolist()
 
     store_data = {"records": df.to_dict("records"), "filename": "search_results.csv"}
     result_card = html.Div(

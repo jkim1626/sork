@@ -10,14 +10,19 @@ from data_access import (
     fetch_table_rows,
     get_allowed_tables,
     get_column_distinct_values,
+    get_table_display_name,
 )
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv(override=True)
 
-# Table Options
-table_options = get_allowed_tables()
+# Table Options - create options with descriptive labels
+_table_list = get_allowed_tables()
+table_options = [
+    {"label": get_table_display_name(table), "value": table}
+    for table in _table_list
+]
 logger = logging.getLogger(__name__)
 
 
@@ -101,76 +106,80 @@ download_layout = dcc.Tab(
                 ),
                 html.Div(
                     [
-                        html.H6("Limit Rows", className="section-title"),
-                        dcc.Checklist(
-                            id="download-limit-toggle",
-                            options=[{"label": " Limit rows", "value": "limit"}],
-                            value=["limit"],
-                            inline=True,
-                        ),
                         html.Div(
                             [
-                                html.Label("Start row", className="control-label"),
-                                dcc.Input(id="download-start-row", type="number", min=1, value=1, className="number-input"),
-                                html.Label("End row", className="control-label"),
-                                dcc.Input(id="download-end-row", type="number", min=1, value=100, className="number-input"),
+                                html.H6("Limit Rows", className="section-title"),
+                                dcc.Checklist(
+                                    id="download-limit-toggle",
+                                    options=[{"label": " Limit rows", "value": "limit"}],
+                                    value=["limit"],
+                                    inline=True,
+                                ),
+                                html.Div(
+                                    [
+                                        html.Label("Start row", className="control-label"),
+                                        dcc.Input(id="download-start-row", type="number", min=1, value=1, className="number-input"),
+                                        html.Label("End row", className="control-label"),
+                                        dcc.Input(id="download-end-row", type="number", min=1, value=100, className="number-input"),
+                                    ],
+                                    id="download-row-limit-controls",
+                                    className="inline-controls",
+                                ),
                             ],
-                            id="download-row-limit-controls",
-                            className="inline-controls",
+                            className="panel-card",
                         ),
-                    ],
-                    className="panel-card",
-                ),
-                html.Div(
-                    [
-                        html.H6("Simple Filter", className="section-title"),
-                        html.P("Optional: choose one column and one or more values before refreshing the preview.", className="section-copy"),
-                        dcc.Dropdown(id="download-filter-column", options=[], value=None, placeholder="Filter column"),
-                        dcc.Dropdown(id="download-filter-values", options=[], value=[], multi=True, placeholder="Values"),
-                    ],
-                    className="panel-card",
-                ),
-                html.Div(
-                    [
-                        html.H6("Columns", className="section-title"),
                         html.Div(
                             [
-                                html.Button("Select All", id="download-select-all-btn", n_clicks=0, className="btn btn-outline-secondary btn-sm"),
-                                html.Button("Deselect All", id="download-deselect-all-btn", n_clicks=0, className="btn btn-outline-secondary btn-sm"),
+                                html.H6("Simple Filter", className="section-title"),
+                                html.P("Optional: choose one column and one or more values before refreshing the preview.", className="section-copy"),
+                                dcc.Dropdown(id="download-filter-column", options=[], value=None, placeholder="Filter column"),
+                                dcc.Dropdown(id="download-filter-values", options=[], value=[], multi=True, placeholder="Values"),
+                            ],
+                            className="panel-card",
+                        ),
+                        html.Div(
+                            [
+                                html.H6("Columns", className="section-title"),
+                                html.Div(
+                                    [
+                                        html.Button("Select All", id="download-select-all-btn", n_clicks=0, className="btn btn-outline-secondary btn-sm"),
+                                        html.Button("Deselect All", id="download-deselect-all-btn", n_clicks=0, className="btn btn-outline-secondary btn-sm"),
+                                    ],
+                                    className="button-row",
+                                ),
+                                dcc.Checklist(
+                                    id="download-columns",
+                                    options=[],
+                                    value=[],
+                                    inline=False,
+                                    labelStyle={"display": "block", "marginBottom": "3px"},
+                                    className="column-checklist",
+                                ),
+                            ],
+                            className="panel-card",
+                        ),
+                        html.Div(
+                            [
+                                html.Button("Refresh Preview", id="preview-button", className="btn btn-success"),
+                                html.Button("Download Flat File", id="download-button", className="btn btn-outline-secondary"),
+                                dcc.Download(id="download-dataframe-csv"),
                             ],
                             className="button-row",
                         ),
-                        dcc.Checklist(
-                            id="download-columns",
-                            options=[],
-                            value=[],
-                            inline=False,
-                            labelStyle={"display": "block", "marginBottom": "3px"},
-                            className="column-checklist",
+                        html.Div(id="download-status"),
+                        html.Div(
+                            [
+                                html.H5("Preview Rows", className="section-title"),
+                                html.Div(id="download-preview"),
+                            ],
+                            className="panel-card",
                         ),
                     ],
-                    className="panel-card",
-                ),
-                html.Div(
-                    [
-                        html.Button("Refresh Preview", id="preview-button", className="btn btn-success"),
-                        html.Button("Download Flat File", id="download-button", className="btn btn-outline-secondary"),
-                        dcc.Download(id="download-dataframe-csv"),
-                    ],
-                    className="button-row",
-                ),
-                html.Div(id="download-status"),
-                html.Div(
-                    [
-                        html.H5("Preview Rows", className="section-title"),
-                        html.Div(id="download-preview"),
-                    ],
-                    className="panel-card",
+                    id="download-container",
+                    style={"display": "none"},
                 ),
             ],
-            id="download-container",
             className="files-workspace",
-            style={"display": "none"},
         ),
     ],
     label="Files",
@@ -181,10 +190,12 @@ download_layout = dcc.Tab(
 # Track tab selection state
 @callback(
     Output('download-tab-active', 'data'),
-    [Input('main-tabs', 'value')]
+    [Input('main-tabs', 'value'), Input('flat-files-subtabs', 'value')]
 )
-def set_download_tab_active(tab_value):
-    return tab_value == 'download-tab'
+def set_download_tab_active(main_tab, sub_tab):
+    # Active if we are on the Flat Files tab AND the download subtab is selected
+    print(f"DEBUG: set_download_tab_active called with main_tab={main_tab!r}, sub_tab={sub_tab!r}")
+    return main_tab == 'flat-files-tab' and sub_tab == 'download-subtab'
 
 # Reset when tab is switched
 @callback(
@@ -222,18 +233,20 @@ def render_table_overview(is_active):
     if not is_active:
         raise PreventUpdate
     cards = []
-    for table in table_options:
+    for table_info in table_options:
+        table_name = table_info["value"]
+        table_label = table_info["label"]
         try:
-            row_count = _get_table_row_count_direct(table)
-            columns = _get_table_columns_direct(table)
+            row_count = _get_table_row_count_direct(table_name)
+            columns = _get_table_columns_direct(table_name)
             body = f"{row_count:,} rows · {len(columns):,} columns"
         except DatabaseAccessError as exc:
-            logger.exception("Unable to summarize table %s", table)
+            logger.exception("Unable to summarize table %s", table_name)
             body = "Unavailable"
         cards.append(
             html.Div(
                 [
-                    html.Div(table, className="summary-card-title"),
+                    html.Div(table_label, className="summary-card-title"),
                     html.Div(body, className="summary-card-body"),
                 ],
                 className="summary-card file-table-card",
