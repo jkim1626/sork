@@ -95,6 +95,31 @@ app.index_string = '''
 </html>
 '''
 
+FLAT_FILE_SUBTAB_STYLE = {
+    "alignItems": "center",
+    "background": "rgba(255, 255, 255, 0.54)",
+    "border": "1px solid rgba(33, 79, 51, 0.12)",
+    "borderRadius": "6px",
+    "boxSizing": "border-box",
+    "color": "#214f33",
+    "cursor": "pointer",
+    "display": "inline-flex",
+    "fontWeight": "700",
+    "height": "30px",
+    "justifyContent": "center",
+    "lineHeight": "1.2",
+    "minWidth": "0",
+    "maxWidth": "150px",
+    "padding": "0 10px",
+}
+
+FLAT_FILE_SUBTAB_SELECTED_STYLE = {
+    **FLAT_FILE_SUBTAB_STYLE,
+    "background": "#ffffff",
+    "border": "1px solid rgba(33, 79, 51, 0.32)",
+    "boxShadow": "0 6px 14px rgba(24, 47, 32, 0.08)",
+}
+
 # Create a combined "Flat File Downloads" tab with upload and download as sub-tabs
 flat_files_layout = dcc.Tab(
     [
@@ -106,17 +131,21 @@ flat_files_layout = dcc.Tab(
                     download_layout.children,
                     label="Download/Browse",
                     id="download-subtab",
-                    style={"padding": "15px"}
+                    style=FLAT_FILE_SUBTAB_STYLE,
+                    selected_style=FLAT_FILE_SUBTAB_SELECTED_STYLE,
                 ),
                 dcc.Tab(
                     upload_layout.children,
                     label="Upload",
                     id="upload-subtab",
-                    style={"padding": "15px"}
+                    style=FLAT_FILE_SUBTAB_STYLE,
+                    selected_style=FLAT_FILE_SUBTAB_SELECTED_STYLE,
                 ),
             ],
             style={"display": "flex", "flex": "1 1 auto", "flexDirection": "column"},
             parent_style={"display": "flex", "flex": "1 1 auto", "flexDirection": "column"},
+            className="flat-files-subtabs",
+            parent_className="flat-files-subtabs__parent",
         )
     ],
     label="Flat File Downloads",
@@ -198,6 +227,10 @@ def build_guest_layout():
             build_app_bar(
                 "Dashboard",
                 actions=[
+                    html.Span(
+                        "Log in for full access, including data uploads and flat-file downloads.",
+                        className="login-access-note",
+                    ),
                     html.A(
                         html.Button("Login", className="btn btn-primary btn-sm login-button"),
                         href="/login",
@@ -217,25 +250,10 @@ def build_guest_layout():
                                             html.P("Public Access", className="content-frame__eyebrow"),
                                             html.H2("Shared data tools", className="content-frame__title"),
                                             html.P(
-                                                "Browse and filter data without an account. Log in for upload access and flat-file downloads.",
+                                                "Browse and filter public data without an account.",
                                                 className="content-frame__subtitle",
                                             ),
                                         ]
-                                    ),
-                                    # Non-blocking login prompt banner
-                                    html.Div(
-                                        [
-                                            html.Span(
-                                                "🔒 Log in for full access — uploads and flat-file downloads require authentication.",
-                                                style={"flex": "1"},
-                                            ),
-                                            html.A(
-                                                html.Button("Login", className="btn btn-primary btn-sm"),
-                                                href="/login",
-                                                style={"marginLeft": "12px"},
-                                            ),
-                                        ],
-                                        className="guest-banner",
                                     ),
                                     html.Div(id='error-message', className="login-panel__error"),
                                 ],

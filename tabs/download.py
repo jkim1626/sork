@@ -194,7 +194,6 @@ download_layout = dcc.Tab(
 )
 def set_download_tab_active(main_tab, sub_tab):
     # Active if we are on the Flat Files tab AND the download subtab is selected
-    print(f"DEBUG: set_download_tab_active called with main_tab={main_tab!r}, sub_tab={sub_tab!r}")
     return main_tab == 'flat-files-tab' and sub_tab == 'download-subtab'
 
 # Reset when tab is switched

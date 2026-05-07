@@ -1,21 +1,25 @@
 from .sql import (
     DatabaseAccessError,
+    append_dataframe_to_holding_table,
     append_dataframe_to_table,
     fetch_query_dataframe,
     fetch_query_dataframe_public,
     fetch_table_rows,
     get_allowed_tables,
     get_column_distinct_values,
+    get_holding_table_name,
     get_table_columns,
     get_table_preview,
     get_table_row_count,
     get_table_schema_preview,
+    validate_upload_dataframe,
     get_engine,
     get_table_display_name,
 )
 
 __all__ = [
     "DatabaseAccessError",
+    "append_dataframe_to_holding_table",
     "append_dataframe_to_table",
     "fetch_query_dataframe",
     "fetch_query_dataframe_public",
@@ -23,9 +27,11 @@ __all__ = [
     "get_allowed_tables",
     "get_column_distinct_values",
     "get_engine",
+    "get_holding_table_name",
     "get_table_columns",
     "get_table_preview",
     "get_table_row_count",
     "get_table_schema_preview",
     "get_table_display_name",
+    "validate_upload_dataframe",
 ]

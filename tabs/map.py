@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 map_table = (os.getenv("MAP_TABLE") or "").strip('"')
 dat_avail_table = os.getenv("DAT_AVAIL_TABLE")
+COMMON_GARDEN_TREE_TABLE = "dat_cgp_db"
 
 SEARCH_ID_COLUMNS = [
     {"label": "Accession", "value": "Accession"},
@@ -39,6 +40,7 @@ INDIVIDUAL_TREE_ZOOM_THRESHOLD = 8
 MAX_UPLOADED_MAP_ROWS = 10000
 MAX_UPLOAD_PREVIEW_ROWS = 8
 TREE_MARKER_COLOR = "#d90429"
+COMMON_GARDEN_TREE_COLOR = "#0891b2"
 DEFAULT_MAP_VIEW = {"center": {"lon": -119.5, "lat": 37.5}, "zoom": 5}
 
 UCLA_COORDINATES = {
@@ -56,6 +58,15 @@ COMMON_GARDEN_SITES = {
     "Sierra Foothill": {"latitude": 39.24, "longitude": -121.29},
     "Riverside": {"latitude": 33.97, "longitude": -117.33},
 }
+COMMON_GARDEN_SITE_ALIASES = {
+    "IFG": "Placerville",
+}
+
+COORDINATE_ALIASES = {
+    "Latitude": ["Latitude", "latitude", "lat", "Lat", "LAT", "Y", "y"],
+    "Longitude": ["Longitude", "longitude", "lon", "Lon", "LON", "long", "Long", "lng", "Lng", "X", "x"],
+}
+SITE_ALIASES = ["locality_full_name", "Site", "site", "Locality", "locality", "Garden", "garden"]
 
 
 def _sanitize_identifier(name):
@@ -114,6 +125,27 @@ def _table_has_column(table_name, column_name):
     if not table_name:
         return False
     return column_name in set(get_table_columns(table_name))
+
+
+def _first_existing(columns, candidates):
+    available = set(columns or [])
+    return next((column for column in candidates if column in available), None)
+
+
+def _normalized_site_key(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _known_garden_coordinates(site_value):
+    canonical_value = COMMON_GARDEN_SITE_ALIASES.get(str(site_value or "").strip(), site_value)
+    site_key = _normalized_site_key(canonical_value)
+    if not site_key:
+        return None
+    for garden_name, coords in COMMON_GARDEN_SITES.items():
+        garden_key = _normalized_site_key(garden_name)
+        if site_key == garden_key or site_key in garden_key or garden_key in site_key:
+            return coords
+    return None
 
 
 def _build_where_clause(table_name, selected_locations=None, selected_years=None, data_filter_col=None, data_filter_val=None):
@@ -191,7 +223,7 @@ def _build_location_options_query(selected_source, data_filter_col=None, data_fi
     if not table_name:
         return None
     base_where = "[locality_full_name] IS NOT NULL AND [Latitude] IS NOT NULL AND [Longitude] IS NOT NULL"
-    if data_filter_col and data_filter_val is not None and data_filter_val != "" and _table_has_column(data_filter_col):
+    if data_filter_col and data_filter_val is not None and data_filter_val != "" and _table_has_column(table_name, data_filter_col):
         base_where += f" AND [{data_filter_col}] = {_sql_literal(data_filter_val)}"
     return f"""
 SELECT DISTINCT [locality_full_name]
@@ -256,9 +288,9 @@ def _availability_panel(selected_source):
         [
             html.H6("Dataset Availability", className="section-title"),
             html.P(note, className="section-copy"),
-            _make_grid(pd.DataFrame(rows), "map-availability-grid", height=300, page_size=8),
+            _make_grid(pd.DataFrame(rows), "map-availability-grid", height=155, page_size=5),
         ],
-        className="panel-card",
+        className="panel-card map-availability-card",
     )
 
 
@@ -289,7 +321,7 @@ def _availability_panel_from_upload(selected_source, upload_data=None, selected_
                         className="section-copy",
                     ),
                 ],
-                className="panel-card panel-card--compact",
+                className="panel-card panel-card--compact map-availability-upload-card",
             ),
         ]
     )
@@ -420,12 +452,105 @@ def _records_to_coordinate_frame(records):
     return df.dropna(subset=["Latitude", "Longitude"])
 
 
+def _fetch_common_garden_tree_coordinates(selected_locations=None, selected_years=None):
+    try:
+        columns = get_table_columns(COMMON_GARDEN_TREE_TABLE)
+    except Exception:
+        return pd.DataFrame()
+
+    lat_col = _first_existing(columns, COORDINATE_ALIASES["Latitude"])
+    lon_col = _first_existing(columns, COORDINATE_ALIASES["Longitude"])
+    site_col = _first_existing(columns, SITE_ALIASES)
+    year_col = "Year" if "Year" in columns else _first_existing(columns, ["year", "YEAR"])
+    accession_col = _first_existing(columns, ["Accession", "accession"])
+    sample_col = _first_existing(columns, ["sample_id", "Sample_ID", "sampleid", "SampleID"])
+
+    if not site_col and not (lat_col and lon_col):
+        return pd.DataFrame()
+
+    selected_cols = []
+    for col in [site_col, year_col, lat_col, lon_col, accession_col, sample_col]:
+        if col and col not in selected_cols:
+            selected_cols.append(col)
+    if not selected_cols:
+        return pd.DataFrame()
+
+    select_sql = ", ".join(f"[{col}]" for col in selected_cols)
+    query = f"SELECT TOP {MAX_UPLOADED_MAP_ROWS} {select_sql} FROM [dbo].[{COMMON_GARDEN_TREE_TABLE}]"
+    try:
+        df = _safe_fetch(query)
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    result = pd.DataFrame()
+    result["source_table"] = COMMON_GARDEN_TREE_TABLE
+    if site_col:
+        result["locality_full_name"] = df[site_col].astype(str)
+        result["Site"] = df[site_col]
+    else:
+        result["locality_full_name"] = "Common Garden trees"
+
+    if year_col:
+        result["Year"] = df[year_col]
+    if accession_col:
+        result["Accession"] = df[accession_col]
+    if sample_col:
+        result["sample_id"] = df[sample_col]
+
+    if lat_col and lon_col:
+        result["Latitude"] = pd.to_numeric(df[lat_col], errors="coerce")
+        result["Longitude"] = pd.to_numeric(df[lon_col], errors="coerce")
+    else:
+        coords = result["locality_full_name"].map(_known_garden_coordinates)
+        result["Latitude"] = coords.map(lambda item: item["latitude"] if item else None)
+        result["Longitude"] = coords.map(lambda item: item["longitude"] if item else None)
+
+    result = result.dropna(subset=["Latitude", "Longitude"]).copy()
+    if selected_locations and "locality_full_name" in result.columns:
+        selected_keys = {_normalized_site_key(value) for value in selected_locations}
+        result = result[result["locality_full_name"].map(_normalized_site_key).isin(selected_keys)]
+    if selected_years and "Year" in result.columns:
+        result = result[result["Year"].astype(str).isin([str(value) for value in selected_years])]
+    return result
+
+
 def _tree_label(row):
     accession = row.get("Accession", "")
     sample_id = row.get("sample_id", "")
     locality = row.get("locality_full_name", "Tree")
     identifier = accession or sample_id
     return f"{locality} ({identifier})" if identifier else str(locality)
+
+
+def _format_coord(value):
+    try:
+        return f"{float(value):.5f}"
+    except (TypeError, ValueError):
+        return "Unknown"
+
+
+def _tree_hover_text(row, source_label=None):
+    label = _tree_label(row)
+    source = source_label or row.get("source_table", "")
+    lines = [
+        f"<b>{label}</b>",
+        f"Latitude: {_format_coord(row.get('Latitude'))}",
+        f"Longitude: {_format_coord(row.get('Longitude'))}",
+    ]
+    site = row.get("Site") or row.get("locality_full_name")
+    if site:
+        lines.append(f"Site/location: {site}")
+    if row.get("Year") not in (None, ""):
+        lines.append(f"Year: {row.get('Year')}")
+    if row.get("Accession") not in (None, ""):
+        lines.append(f"Accession: {row.get('Accession')}")
+    if row.get("sample_id") not in (None, ""):
+        lines.append(f"Sample ID: {row.get('sample_id')}")
+    if source:
+        lines.append(str(source))
+    return "<br>".join(lines)
 
 
 def _viewport_from_relayout(relayout_data, current_view=None):
@@ -458,6 +583,7 @@ map_layout = dcc.Tab(
         dcc.Store(id="search-result-store", data=None),
         dcc.Store(id="uploaded-tree-store", data=None, storage_type="session"),
         dcc.Store(id="map-coordinate-store", data=None),
+        dcc.Store(id="map-selected-coordinate-store", data=None),
         dcc.Store(id="map-viewport-store", data=DEFAULT_MAP_VIEW, storage_type="session"),
         dcc.Download(id="click-download-csv"),
         dcc.Download(id="search-download-csv"),
@@ -541,17 +667,12 @@ map_layout = dcc.Tab(
                                     className="data-filter-panel",
                                 ),
                                 html.Div(
-                                    f"Common garden reference sites are shown as teal diamonds. Choose a dataset first if filters are empty. Green circles = data sites, gold = UCLA, red = individual trees (zoom {INDIVIDUAL_TREE_ZOOM_THRESHOLD}+), blue = uploaded, purple = search hits.",
+                                    f"Known garden sites are shown as teal reference markers. Green circles = data sites, gold = UCLA, red = individual trees (zoom {INDIVIDUAL_TREE_ZOOM_THRESHOLD}+), blue = uploaded, purple = search hits.",
                                     className="info-banner",
                                 ),
                                 html.Div(
                                     [
                                         html.Button("Reset View", id="reset-map", className="btn btn-success btn-sm"),
-                                        html.Button(
-                                            "Download Coordinates",
-                                            id="download-map-coordinates-btn",
-                                            className="btn btn-outline-secondary btn-sm",
-                                        ),
                                     ],
                                     className="button-row",
                                 ),
@@ -562,7 +683,7 @@ map_layout = dcc.Tab(
                             [
                                 html.H6("Upload Tree List", className="section-title"),
                                 html.P(
-                                    "Upload CSV or TSV rows with Latitude and Longitude to add a temporary tree layer to the map. Optional columns such as locality_full_name, Site, Accession, sample_id, and Year improve filtering and labels.",
+                                    "Upload CSV or TSV rows with Latitude and Longitude to add a temporary tree layer to the map.",
                                     className="section-copy",
                                 ),
                                 dcc.Upload(
@@ -579,13 +700,13 @@ map_layout = dcc.Tab(
                                 ),
                                 html.Div(id="map-upload-status"),
                             ],
-                            className="panel-card",
+                            className="panel-card map-tool-card",
                         ),
                         html.Div(
                             [
                                 html.H6("Find Trees", className="section-title"),
                                 html.P(
-                                    "Paste known Accessions or sample IDs, then search. Results appear as purple points and in a downloadable grid below.",
+                                    "Paste known Accessions or sample IDs. Results appear as purple points and in the results panel.",
                                     className="section-copy",
                                 ),
                                 html.Label("Identifier type", className="control-label"),
@@ -619,11 +740,8 @@ map_layout = dcc.Tab(
                                     className="button-row",
                                 ),
                             ],
-                            className="panel-card",
+                            className="panel-card map-tool-card",
                         ),
-                        html.Div(id="map-availability-panel", children=html.Div("Loading dataset availability...", className="placeholder-card")),
-                        html.Div(id="search-results-data"),
-                        html.Div(id="individual-tree-data"),
                     ],
                     className="map-sidebar",
                 ),
@@ -652,6 +770,47 @@ map_layout = dcc.Tab(
                             "Warning: detailed tree rendering and large search exports may take a while on broad dataset scopes.",
                             className="warning-banner",
                         ),
+                        html.Div(id="map-availability-panel", className="map-availability-strip", children=html.Div("Loading dataset availability...", className="placeholder-card")),
+                        html.Div(
+                            [
+                                html.Div(
+                                    [
+                                        html.Div(
+                                            [
+                                                html.H6("Selected Site & Coordinates", className="section-title"),
+                                                html.Button(
+                                                    "Clear Selection",
+                                                    id="clear-map-selection-btn",
+                                                    n_clicks=0,
+                                                    className="btn btn-outline-secondary btn-sm",
+                                                ),
+                                            ],
+                                            className="selection-download-header",
+                                        ),
+                                        html.Div(id="individual-tree-data", className="selection-inspection-area"),
+                                        html.Div(
+                                            [
+                                                html.Div(id="map-coordinate-selection-status", className="coordinate-selection-status"),
+                                                html.Div(
+                                                    [
+                                                        html.Button(
+                                                            "Download Coordinates",
+                                                            id="download-map-coordinates-btn",
+                                                            className="btn btn-success btn-sm",
+                                                        ),
+                                                    ],
+                                                    className="button-row coordinate-download-actions",
+                                                ),
+                                            ],
+                                            className="coordinate-download-section",
+                                        ),
+                                    ],
+                                    className="panel-card selection-download-card",
+                                ),
+                                html.Div(id="search-results-data"),
+                            ],
+                            className="map-results-stack",
+                        ),
                     ],
                     className="map-main",
                 ),
@@ -676,6 +835,7 @@ map_layout = dcc.Tab(
         Output("search-result-store", "data", allow_duplicate=True),
         Output("uploaded-tree-store", "data", allow_duplicate=True),
         Output("map-coordinate-store", "data", allow_duplicate=True),
+        Output("map-selected-coordinate-store", "data", allow_duplicate=True),
         Output("map-viewport-store", "data", allow_duplicate=True),
         Output("map-upload-status", "children", allow_duplicate=True),
         Output("search-results-data", "children", allow_duplicate=True),
@@ -698,6 +858,7 @@ def reset_tree_sites_state(active_tab, reset_clicks):
         None,
         SEARCH_ID_COLUMNS[0]["value"],
         "",
+        None,
         None,
         None,
         None,
@@ -785,16 +946,16 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
                 lat=locations_df["avg_latitude"].tolist(),
                 marker={"size": sizes, "color": "#0b6b3a", "opacity": 0.92},
                 hovertext=[
-                    f"{row['locality_full_name']}<br>{row['tree_count']} tree records"
+                    f"<b>{row['locality_full_name']}</b><br>{row['tree_count']} tree records<br>Latitude: {_format_coord(row['avg_latitude'])}<br>Longitude: {_format_coord(row['avg_longitude'])}"
                     for _, row in locations_df.iterrows()
                 ],
                 hoverinfo="text",
                 customdata=[[map_table, row["locality_full_name"]] for _, row in locations_df.iterrows()],
-                name="Common Gardens",
+                name="Data Sites",
             )
         )
     else:
-        fig.add_trace(go.Scattermapbox(mode="markers", lon=[], lat=[], name="Common Gardens"))
+        fig.add_trace(go.Scattermapbox(mode="markers", lon=[], lat=[], name="Data Sites"))
 
     fig.add_trace(
         go.Scattermapbox(
@@ -816,9 +977,13 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
             mode="markers",
             lon=garden_lons,
             lat=garden_lats,
-            marker={"size": 22, "color": "#0d9488", "opacity": 0.95, "symbol": "circle"},
-            hovertext=[f"<b>{name}</b><br>Known common garden site" for name in garden_names],
+            marker={"size": 18, "color": "#0d9488", "opacity": 0.98, "symbol": "circle"},
+            hovertext=[
+                f"<b>{name}</b><br>Known garden site<br>Latitude: {_format_coord(COMMON_GARDEN_SITES[name]['latitude'])}<br>Longitude: {_format_coord(COMMON_GARDEN_SITES[name]['longitude'])}"
+                for name in garden_names
+            ],
             hoverinfo="text",
+            customdata=[[name] for name in garden_names],
             name="Known Garden Sites",
         )
     )
@@ -835,7 +1000,7 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
             marker={"size": 15, "color": TREE_MARKER_COLOR, "opacity": 0.97},
             hoverinfo="text",
             hovertext=[
-                f"Tree: {_tree_label(row)}<br>{row['source_table']}<br>Accession: {row.get('Accession', '')}<br>Sample ID: {row.get('sample_id', '')}"
+                _tree_hover_text(row)
                 for _, row in tree_layer_df.iterrows()
             ] if not tree_layer_df.empty else [],
             customdata=tree_layer_df[["source_table", "Latitude", "Longitude", "locality_full_name"]].values.tolist()
@@ -869,7 +1034,7 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
                 lat=uploaded_df["Latitude"].tolist(),
                 marker={"size": 16, "color": "#0066ff", "opacity": 0.94},
                 hovertext=[
-                    f"{row.get('locality_full_name', 'Uploaded trees')}<br>Uploaded tree list<br>Accession: {row.get('Accession', '')}"
+                    _tree_hover_text(row, "Uploaded tree list")
                     for _, row in uploaded_df.iterrows()
                 ],
                 hoverinfo="text",
@@ -892,6 +1057,29 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
                 name="Uploaded Trees",
             )
         )
+
+    common_garden_tree_df = _fetch_common_garden_tree_coordinates(selected_locations, selected_years)
+    if not common_garden_tree_df.empty:
+        coordinate_records.extend(common_garden_tree_df.to_dict("records"))
+    fig.add_trace(
+        go.Scattermapbox(
+            mode="markers",
+            lon=common_garden_tree_df["Longitude"].tolist() if not common_garden_tree_df.empty else [],
+            lat=common_garden_tree_df["Latitude"].tolist() if not common_garden_tree_df.empty else [],
+            marker={"size": 13, "color": COMMON_GARDEN_TREE_COLOR, "opacity": 0.88, "symbol": "square"},
+            hovertext=[
+                _tree_hover_text(row, "Common Garden data")
+                for _, row in common_garden_tree_df.iterrows()
+            ] if not common_garden_tree_df.empty else [],
+            hoverinfo="text",
+            customdata=[
+                [COMMON_GARDEN_TREE_TABLE, row.get("Latitude"), row.get("Longitude"), row.get("locality_full_name", "Common Garden tree")]
+                for _, row in common_garden_tree_df.iterrows()
+            ] if not common_garden_tree_df.empty else [],
+            name="Common Garden Trees",
+            showlegend=False,
+        )
+    )
 
     fig.update_layout(
         mapbox={
@@ -945,6 +1133,11 @@ def update_location_filter_options(selected_source, upload_data, current_values)
         for value in upload_df["locality_full_name"].dropna().unique().tolist():
             options_by_value[str(value)] = {"label": f"{value} (uploaded)", "value": value}
 
+    common_garden_df = _fetch_common_garden_tree_coordinates()
+    if not common_garden_df.empty and "locality_full_name" in common_garden_df.columns:
+        for value in common_garden_df["locality_full_name"].dropna().unique().tolist():
+            options_by_value[str(value)] = {"label": f"{value} (common garden)", "value": value}
+
     options = list(options_by_value.values())
     valid_values = {option["value"] for option in options}
     selected = [value for value in (current_values or []) if value in valid_values]
@@ -975,6 +1168,11 @@ def update_year_filter_options(selected_source, selected_locations, upload_data,
             upload_df = upload_df[upload_df["locality_full_name"].astype(str).isin([str(v) for v in selected_locations])]
         for value in upload_df["Year"].dropna().unique().tolist():
             options_by_value[str(value)] = {"label": f"{value} (uploaded)", "value": value}
+
+    common_garden_df = _fetch_common_garden_tree_coordinates(selected_locations=selected_locations)
+    if not common_garden_df.empty and "Year" in common_garden_df.columns:
+        for value in common_garden_df["Year"].dropna().unique().tolist():
+            options_by_value[str(value)] = {"label": f"{value} (common garden)", "value": value}
 
     options = list(options_by_value.values())
     valid_keys = set(options_by_value.keys())
@@ -1087,12 +1285,22 @@ def handle_map_tree_upload(contents, clear_clicks, filename):
 
 
 @callback(
-    [Output("individual-tree-data", "children"), Output("click-result-store", "data")],
+    [
+        Output("individual-tree-data", "children"),
+        Output("click-result-store", "data"),
+        Output("map-selected-coordinate-store", "data"),
+    ],
     Input("stored-click-data", "data"),
 )
 def display_click_data(click_data):
     if not click_data or "points" not in click_data or not click_data["points"]:
-        return html.Div("Select a site or individual tree to inspect details.", className="placeholder-card"), None
+        return html.Div(
+            [
+                html.Div("No site selected", className="selection-card-title"),
+                html.Div("Select a site or tree on the map to inspect details. Coordinate download will include all active map coordinates until a selection is made.", className="selection-card-copy"),
+            ],
+            className="selection-empty-state",
+        ), None, None
 
     try:
         point = click_data["points"][0]
@@ -1105,36 +1313,90 @@ def display_click_data(click_data):
                     _summary_card("UCLA", "University of California, Los Angeles", "#f2b705"),
                     html.P("UCLA is shown as a fixed reference point on the map.", className="section-copy"),
                 ],
-                className="panel-card",
-            ), None
+                className="selection-inspection-content",
+            ), None, None
 
         if curve == 2:
             # Known Garden Sites static layer — no DB query needed
-            name = next((k for k, v in COMMON_GARDEN_SITES.items()), "Known common garden site")
             site_name = (customdata or [None])[0] if customdata else None
             display_name = str(site_name) if site_name else "Known common garden site"
+            coords = COMMON_GARDEN_SITES.get(display_name)
+            selected = None
+            if coords:
+                selected = {
+                    "records": [
+                        {
+                            "source_table": "Known Garden Sites",
+                            "locality_full_name": display_name,
+                            "Site": display_name,
+                            "Latitude": coords["latitude"],
+                            "Longitude": coords["longitude"],
+                        }
+                    ],
+                    "filename": f"known_garden_{display_name.replace(' ', '_')}_coordinates.csv",
+                    "label": display_name,
+                    "kind": "Known garden site",
+                }
             return html.Div(
                 [
                     _summary_card("Common Garden Site", display_name, "#0d9488"),
                     html.P(
-                        "This is a known common garden reference site. Coordinates are hardcoded in the app. "
-                        "Contact the lab manager to update them.",
+                        "This known common garden reference site is selected for coordinate download.",
                         className="section-copy",
                     ),
                 ],
-                className="panel-card",
-            ), None
+                className="selection-inspection-content",
+            ), None, selected
+
+        if curve == 6:
+            source_table, latitude, longitude, locality_name = customdata
+            selected = {
+                "records": [
+                    {
+                        "source_table": source_table,
+                        "locality_full_name": locality_name,
+                        "Latitude": latitude,
+                        "Longitude": longitude,
+                    }
+                ],
+                "filename": f"{str(locality_name).replace(' ', '_')}_common_garden_coordinate.csv",
+                "label": locality_name,
+                "kind": "Common Garden data point",
+            }
+            return html.Div(
+                [
+                    _summary_card("Common Garden Tree", locality_name, COMMON_GARDEN_TREE_COLOR),
+                    html.P(
+                        "This Common Garden data point is selected for coordinate download.",
+                        className="section-copy",
+                    ),
+                ],
+                className="selection-inspection-content",
+            ), None, selected
 
         if curve in (3, 5):  # Individual Trees (3) or Uploaded Trees (5)
             source_table, latitude, longitude, locality_name = customdata
             if source_table == "Uploaded tree list":
+                selected = {
+                    "records": [
+                        {
+                            "source_table": source_table,
+                            "locality_full_name": locality_name,
+                            "Latitude": latitude,
+                            "Longitude": longitude,
+                        }
+                    ],
+                    "filename": f"{str(locality_name).replace(' ', '_')}_uploaded_coordinate.csv",
+                    "label": locality_name,
+                    "kind": "Uploaded tree",
+                }
                 return html.Div(
                     [
                         _summary_card("Uploaded Tree", locality_name, "#0d6efd"),
-                        html.P("This row came from the current uploaded tree list. Use Download Coordinates to export it with the rest of the active map coordinates.", className="section-copy"),
+                        html.P("This uploaded tree is selected for coordinate download.", className="section-copy"),
                     ],
-                    className="panel-card",
-                ), None
+                    className="selection-inspection-content",
+                ), None, selected
             detail_query = _build_detail_query(source_table, latitude=latitude, longitude=longitude)
             df = _safe_fetch(detail_query) if detail_query else pd.DataFrame()
             header_text = f"{locality_name} tree record"
@@ -1149,15 +1411,21 @@ def display_click_data(click_data):
             filename = f"{source_table}_{str(locality_name).replace(' ', '_')}.csv"
 
         if df is None or df.empty:
-            return html.Div("No data available for this selection.", className="placeholder-card"), None
+            return html.Div("No data available for this selection.", className="selection-empty-state"), None, None
 
         store_data = {"records": df.to_dict("records"), "filename": filename}
+        selected_data = {
+            "records": df.to_dict("records"),
+            "filename": filename,
+            "label": header_text,
+            "kind": "Selected site" if curve not in (3, 5, 6) else "Selected tree",
+        }
         return (
             html.Div(
                 [
                     _summary_card("Selected Site", header_text, "#1d3557"),
                     _summary_card("Details", summary, "#2d6a4f"),
-                    html.Button("Download Coordinates CSV", id="click-download-btn", n_clicks=0, className="btn btn-success"),
+                    html.P("Use the Coordinate Download card to export this selection, or clear it to download all active map coordinates.", className="section-copy"),
                     html.Details(
                         [
                             html.Summary("View raw rows"),
@@ -1166,12 +1434,13 @@ def display_click_data(click_data):
                         className="details-panel",
                     ),
                 ],
-                className="panel-card",
+                className="selection-inspection-content",
             ),
             store_data,
+            selected_data,
         )
     except Exception:
-        return html.Div("Details are unavailable for this selection.", className="placeholder-card"), None
+        return html.Div("Details are unavailable for this selection.", className="selection-empty-state"), None, None
 
 
 @callback(
@@ -1226,7 +1495,7 @@ FROM (
         patched_fig["data"][3]["marker"]["color"] = TREE_MARKER_COLOR
         patched_fig["data"][3]["marker"]["opacity"] = 0.97
         patched_fig["data"][3]["hovertext"] = [
-            f"Tree: {_tree_label(row)}<br>{row['source_table']}<br>Accession: {row.get('Accession', '')}<br>Sample ID: {row.get('sample_id', '')}"
+            _tree_hover_text(row)
             for _, row in trees_df.iterrows()
         ]
         patched_fig["data"][3]["customdata"] = trees_df[
@@ -1307,7 +1576,7 @@ WHERE [{id_type}] IN ({ids_sql})
     patched_fig["data"][4]["marker"]["color"] = "#6d28d9"
     patched_fig["data"][4]["marker"]["opacity"] = 0.96
     patched_fig["data"][4]["hovertext"] = [
-        f"{row['locality_full_name']}<br>{row['source_table']}<br>{id_type}: {row.get(id_type, '')}"
+        _tree_hover_text(row)
         for _, row in map_df.iterrows()
     ]
     patched_fig["data"][4]["customdata"] = map_df[["source_table", "locality_full_name"]].values.tolist()
@@ -1329,6 +1598,50 @@ WHERE [{id_type}] IN ({ids_sql})
         className="panel-card",
     )
     return patched_fig, result_card, store_data
+
+
+@callback(
+    Output("stored-click-data", "data", allow_duplicate=True),
+    Input("clear-map-selection-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def clear_map_selection(n_clicks):
+    if not n_clicks:
+        raise PreventUpdate
+    return None
+
+
+@callback(
+    Output("map-coordinate-selection-status", "children"),
+    [Input("map-selected-coordinate-store", "data"), Input("map-coordinate-store", "data")],
+)
+def render_coordinate_selection_status(selected_data, coordinate_records):
+    if selected_data and selected_data.get("records"):
+        count = len(selected_data.get("records") or [])
+        return html.Div(
+            [
+                html.Div("Current download selection", className="selection-card-label"),
+                html.Div(selected_data.get("label") or "Selected map point", className="selection-card-title"),
+                html.Div(
+                    f"{selected_data.get('kind', 'Selection')} · {count:,} coordinate row{'s' if count != 1 else ''}",
+                    className="selection-card-copy",
+                ),
+            ],
+            className="selection-card selection-card--active",
+        )
+
+    total = len(coordinate_records or [])
+    return html.Div(
+        [
+            html.Div("Current download selection", className="selection-card-label"),
+            html.Div("All active map coordinates", className="selection-card-title"),
+            html.Div(
+                f"No site selected · {total:,} coordinate row{'s' if total != 1 else ''} ready",
+                className="selection-card-copy",
+            ),
+        ],
+        className="selection-card",
+    )
 
 
 @callback(
@@ -1360,14 +1673,21 @@ def download_search_csv(n_clicks, store_data):
 @callback(
     Output("map-download-coordinates", "data"),
     Input("download-map-coordinates-btn", "n_clicks"),
-    State("map-coordinate-store", "data"),
+    [State("map-coordinate-store", "data"), State("map-selected-coordinate-store", "data")],
     prevent_initial_call=True,
 )
-def download_map_coordinates(n_clicks, records):
-    if not n_clicks or not records:
+def download_map_coordinates(n_clicks, records, selected_data):
+    if not n_clicks:
+        return no_update
+    if selected_data and selected_data.get("records"):
+        records = selected_data["records"]
+        filename = selected_data.get("filename") or "selected_map_coordinates.csv"
+    else:
+        filename = "active_map_coordinates.csv"
+    if not records:
         return no_update
     df = pd.DataFrame(records)
     keep = [column for column in ["source_table", "locality_full_name", "Latitude", "Longitude", "Accession", "sample_id", "Year", "Site"] if column in df.columns]
     if keep:
         df = df[keep + [column for column in df.columns if column not in keep]]
-    return dcc.send_data_frame(df.to_csv, "active_map_coordinates.csv", index=False)
+    return dcc.send_data_frame(df.to_csv, filename, index=False)

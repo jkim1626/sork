@@ -60,9 +60,39 @@ CORE_TABLES = {
 
 MATERNAL_TREE_TABLE = "Valley oak maternal tree climate data BCM 2018_03_08"
 GARDENS_TABLE = "gardens_20152023prismmonthly"
+CORE_JOIN_KEYS_BY_TABLE = {
+    "leaf_traits_2016": ["Accession", "Locality", "Site"],
+}
+DEFAULT_CORE_JOIN_KEYS = ["Accession", "Locality", "Year", "Site"]
+TREE_JOIN_KEYS = {"Accession", "Locality"}
+GARDEN_JOIN_KEYS = {"Site", "Year"}
 
 # Whitelists for validation
 ALLOWED_CORE_TABLES = set(CORE_TABLES.keys())
+
+
+def _required_core_cols(core_table):
+    return CORE_JOIN_KEYS_BY_TABLE.get(core_table, DEFAULT_CORE_JOIN_KEYS)
+
+
+def _hide_join_key_options(columns, hidden_keys):
+    hidden = set(hidden_keys or [])
+    return [{'label': c, 'value': c} for c in columns if c not in hidden]
+
+
+def _garden_join_validation_message(core_table, core_columns=None, garden_columns=None):
+    if core_columns is None:
+        return "Garden Climate requires Site + Year, but the selected dataset columns could not be verified right now."
+    core_cols = set(core_columns or [])
+    missing_core = [col for col in ("Site", "Year") if col not in core_cols]
+    if missing_core:
+        return f"Garden Climate joins by Site + Year, but {CORE_TABLES.get(core_table, core_table)} does not expose: {', '.join(missing_core)}."
+    if garden_columns is not None:
+        garden_cols = set(garden_columns or [])
+        missing_garden = [col for col in ("Site", "Year") if col not in garden_cols]
+        if missing_garden:
+            return f"Garden Climate joins by Site + Year, but the Garden Climate table does not expose: {', '.join(missing_garden)}."
+    return None
 
 # Create a layout for the joins tab
 joins_layout = dcc.Tab(
@@ -82,12 +112,11 @@ joins_layout = dcc.Tab(
                 html.Div([
                     html.H4("Select & Filter Data", style={"marginBottom": "10px", "color": "#133817"}),
                     html.P(
-                        "Start with the garden dataset, apply early filters, then choose only the variables you need. "
-                        "The dashboard handles the join logic behind the scenes and shows a limited preview by default.",
+                        "Choose one dataset or combine datasets only when needed. Required identifiers and join keys are included automatically, so they are not shown in the variable checklists.",
                         style={"color": "#666", "marginBottom": "20px", "fontSize": "0.95em"}
                     ),
                     html.Div(
-                        "Warning: larger joins and exports may take a while. Safe defaults are enabled so you preview results before pulling everything.",
+                        "Garden Climate is opt-in and requires both Site and Year. Larger joins and exports may take a while, so the preview is limited by default.",
                         style={"backgroundColor": "#fff3cd", "border": "1px solid #ffe69c", "padding": "10px 12px", "borderRadius": "6px", "fontSize": "0.9em"},
                     ),
                 ], style={"marginBottom": "25px", "padding": "15px", "backgroundColor": "#f0f7f2", "borderRadius": "8px"}),
@@ -138,7 +167,7 @@ joins_layout = dcc.Tab(
                 html.Div([
                     html.Div([
                         html.H5("Step 3: Garden Dataset Columns", style={"fontWeight": "bold", "marginBottom": "5px", "color": "#133817"}),
-                        html.P("No columns selected by default. Pick the ones you need, or use Select All.", 
+                        html.P("No columns selected by default. Join keys such as Accession, Locality, Site, and Year are included automatically when needed.", 
                                style={"color": "#666", "fontSize": "0.85em", "marginBottom": "10px"}),
                         html.Div([
                             html.Button("Select All", id="join-select_all_btn", n_clicks=0, 
@@ -161,7 +190,7 @@ joins_layout = dcc.Tab(
                 html.Div([
                     html.Div([
                         html.H5("Step 4: Maternal Tree Climate Data", style={"fontWeight": "bold", "marginBottom": "5px", "color": "#133817"}),
-                        html.P("Climate data from the original tree locations. Automatically matched by Accession and Locality.", 
+                        html.P("Climate data from original tree locations. Optional: select these variables to join by Accession and Locality. You can also leave this section empty.", 
                                style={"color": "#666", "fontSize": "0.85em", "marginBottom": "10px"}),
                         html.Div([
                             html.Button("Select All", id="join-select_all_btn-2", n_clicks=0, 
@@ -184,7 +213,7 @@ joins_layout = dcc.Tab(
                 html.Div([
                     html.Div([
                         html.H5("Step 5: Garden Climate Data", style={"fontWeight": "bold", "marginBottom": "5px", "color": "#133817"}),
-                        html.P("Monthly climate data from garden sites. Automatically matched by Site (and Year, if available).", 
+                        html.P("Monthly climate data from garden sites. Optional and matched strictly by Site + Year; datasets without both keys are blocked before running.", 
                                style={"color": "#666", "fontSize": "0.85em", "marginBottom": "10px"}),
                         html.Div([
                             html.Button("Select All", id="join-select_all_btn-3", n_clicks=0, 
@@ -740,18 +769,19 @@ def update_core_table_columns(selected_table, metadata_store):
         gardens_cols = column_data.get('gardens_columns', [])
         tree_cols = column_data.get('tree_columns', [])
         
-        # Create options — all default to de-selected (empty value lists)
-        GARDENS_TABLE_OPTIONS = [{'label': c, 'value': c} for c in gardens_cols]
-        MATERNAL_TREE_OPTIONS = [{'label': c, 'value': c} for c in tree_cols]
+        # Create user-facing options without required join keys. Keys are added
+        # internally when a join is built so users do not have to select them.
+        GARDENS_TABLE_OPTIONS = _hide_join_key_options(gardens_cols, GARDEN_JOIN_KEYS)
+        MATERNAL_TREE_OPTIONS = _hide_join_key_options(tree_cols, TREE_JOIN_KEYS)
 
         # Fetch core table columns (not cached since it depends on selection)
-        sample_df = _fetch_for_user(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
-        if sample_df is None or sample_df.empty:
+        sample_df = _fetch_for_user(f"SELECT TOP 0 * FROM [dbo].[{selected_table}]")
+        if sample_df is None or not len(sample_df.columns):
             error_msg = "Error: Could not fetch columns from selected table"
             return [], [], {"display": "none"}, [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg, [], [], {"display": "none"}
         
         cols = sample_df.columns.tolist()
-        opts = [{'label': c, 'value': c} for c in cols]
+        opts = _hide_join_key_options(cols, _required_core_cols(selected_table))
         
         # Fetch available years and sites for pre-join filtering
         year_options = []
@@ -871,6 +901,11 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars, year_filt
         return "", {"display": "none"}
     
     preview_parts = []
+    try:
+        core_df = _fetch_for_user(f"SELECT TOP 0 * FROM [dbo].[{core_table}]")
+        core_columns = core_df.columns.tolist() if core_df is not None else []
+    except Exception:
+        core_columns = None
     
     # Core table info
     core_name = CORE_TABLES.get(core_table, core_table)
@@ -908,16 +943,21 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars, year_filt
     # Garden climate info
     if garden_vars:
         garden_count = len(garden_vars)
-        if core_table == "leaf_traits_2016":
-            match_info = "(Matched by Site)"
-        else:
-            match_info = "(Matched by Year + Site)"
+        garden_validation = _garden_join_validation_message(core_table, core_columns, None)
+        match_info = "(Matched by Site + Year)"
         preview_parts.append(html.Div([
             html.Strong("Garden Climate:"), 
             html.Span(f" {garden_count} columns selected", style={"marginLeft": "10px"}),
             html.Br(),
             html.Span(match_info, style={"fontSize": "0.85em", "color": "#888", "marginLeft": "20px"})
         ], style={"marginBottom": "8px"}))
+        if garden_validation:
+            preview_parts.append(html.Div(garden_validation, className="status-warning"))
+    else:
+        preview_parts.append(html.Div(
+            "Garden Climate is not selected. Single-dataset exports and joins without Garden Climate are allowed.",
+            style={"fontSize": "0.85em", "color": "#666", "marginBottom": "8px"},
+        ))
     
     if not core_vars and not tree_vars and not garden_vars:
         preview_parts.append(html.Div([
@@ -959,14 +999,21 @@ def execute_join(n_clicks, core_table, core_table_vars, maternal_tree_vars, gard
         # Validate table name
         validate_table_name(core_table, ALLOWED_CORE_TABLES)
         
-        # 1) Required core columns
-        if core_table == "leaf_traits_2016":
-            required_core_cols = ["Accession", "Locality", "Site"]
-            garden_key_cols = {"Site"}
-        else:
-            required_core_cols = ["Accession", "Locality", "Year", "Site"]
-            garden_key_cols = {"Year", "Site"}
-        tree_key_cols = {"Accession", "Locality"}
+        core_schema_df = _fetch_for_user(f"SELECT TOP 0 * FROM [dbo].[{core_table}]")
+        garden_schema_df = _fetch_for_user(f"SELECT TOP 0 * FROM [dbo].[{GARDENS_TABLE}]")
+        core_columns = core_schema_df.columns.tolist() if core_schema_df is not None else []
+        garden_columns = garden_schema_df.columns.tolist() if garden_schema_df is not None else []
+
+        # 1) Required core columns. Join keys are hidden from checklists but
+        # always included in outputs when they exist on the selected core table.
+        required_core_cols = [c for c in _required_core_cols(core_table) if c in core_columns]
+        tree_key_cols = TREE_JOIN_KEYS
+        garden_key_cols = GARDEN_JOIN_KEYS
+
+        if garden_climate_vars:
+            garden_error = _garden_join_validation_message(core_table, core_columns, garden_columns)
+            if garden_error:
+                return None, dash.no_update, {"display": "none"}, {"display": "none"}, "Join Data & View Results", False, garden_error, 100, {"display": "block", "height": "100%"}
 
         # 2) Core SELECT
         core_cols = required_core_cols[:]
@@ -976,7 +1023,7 @@ def execute_join(n_clicks, core_table, core_table_vars, maternal_tree_vars, gard
         selected_clauses = [core_sel]
 
         # 3) Clean out any key-columns from the non-core selections
-        safe_tree_vars   = [c for c in maternal_tree_vars   or [] if c not in tree_key_cols]
+        safe_tree_vars = [c for c in maternal_tree_vars or [] if c not in tree_key_cols]
         safe_garden_vars = [c for c in garden_climate_vars or [] if c not in garden_key_cols]
 
         # 4) Maternal-tree join
@@ -1003,6 +1050,8 @@ LEFT JOIN (
 
         # 5) Garden-climate join
         if garden_climate_vars:
+            if not safe_garden_vars:
+                return None, dash.no_update, {"display": "none"}, {"display": "none"}, "Join Data & View Results", False, "Select at least one non-key Garden Climate variable. Site and Year are included automatically.", 100, {"display": "block", "height": "100%"}
             if safe_garden_vars:
                 garden_sel = ", ".join(
                     f"garden.[{c}] AS [garden_{c.replace(' ', '_')}]"
@@ -1010,13 +1059,8 @@ LEFT JOIN (
                 )
                 selected_clauses.append(garden_sel)
 
-            if core_table == "leaf_traits_2016":
-                garden_cols = ["[Site]"] + [f"[{c}]" for c in safe_garden_vars]
-                join_cond   = "core.[Site] = garden.[Site]"
-            else:
-                garden_cols = ["TRY_CAST(TRY_CAST([Year] AS NUMERIC) AS INT) AS [Year]",
-                               "[Site]"] + [f"[{c}]" for c in safe_garden_vars]
-                join_cond   = "core.[Year] = garden.[Year] AND core.[Site] = garden.[Site]"
+            garden_cols = ["TRY_CAST(TRY_CAST([Year] AS NUMERIC) AS INT) AS [Year]", "[Site]"] + [f"[{c}]" for c in safe_garden_vars]
+            join_cond = "core.[Year] = garden.[Year] AND core.[Site] = garden.[Site]"
 
             joins.append(f"""
 LEFT JOIN (
@@ -1028,7 +1072,7 @@ LEFT JOIN (
 
         # 6) Build WHERE clause for pre-join filters
         where_clauses = []
-        if year_filter and len(year_filter) > 0 and "Year" in required_core_cols:
+        if year_filter and len(year_filter) > 0 and "Year" in core_columns:
             year_placeholders = ", ".join(str(int(y)) for y in year_filter)
             where_clauses.append(f"core.[Year] IN ({year_placeholders})")
         if site_filter and len(site_filter) > 0:
@@ -1280,15 +1324,49 @@ FROM (
 # Reset results when any selection changes
 @callback(
     [Output("join-tab-results-div", "style", allow_duplicate=True),
-     Output("join-row-count-container", "style", allow_duplicate=True)],
+     Output("join-row-count-container", "style", allow_duplicate=True),
+     Output("join-tab-full-query", "data", allow_duplicate=True),
+     Output("join-grid-wrapper", "children", allow_duplicate=True),
+     Output("join-tab-results-stats", "children", allow_duplicate=True),
+     Output("join-filter-count-text", "children", allow_duplicate=True),
+     Output("join-selected-count-text", "children", allow_duplicate=True),
+     Output("join-download-warning", "children", allow_duplicate=True),
+     Output("stats-main-container", "style", allow_duplicate=True),
+     Output("stats-test-dropdown", "value", allow_duplicate=True),
+     Output("test-container", "style", allow_duplicate=True),
+     Output("lr-output-content", "children", allow_duplicate=True),
+     Output("pca-output-content", "children", allow_duplicate=True),
+     Output("summary-output-content", "children", allow_duplicate=True),
+     Output("pd-output-content", "children", allow_duplicate=True),
+     Output("join-right-placeholder", "style", allow_duplicate=True)],
     [Input("join-core-table-options", "value"),
      Input("join-tree-table-options", "value"),
-     Input("join-garden-table-options", "value")],
+     Input("join-garden-table-options", "value"),
+     Input("join-year-filter", "value"),
+     Input("join-site-filter", "value")],
     prevent_initial_call=True
 )
-def reset_results_on_selection_change(core_vars, tree_vars, garden_vars):
-    # Hide results whenever selections change
-    return {"display": "none"}, {"display": "none"}
+def reset_results_on_selection_change(core_vars, tree_vars, garden_vars, year_filter, site_filter):
+    # Hide and clear stale generated outputs whenever selected inputs change.
+    empty = html.Div()
+    return (
+        {"display": "none"},
+        {"display": "none"},
+        None,
+        empty,
+        "",
+        "",
+        "",
+        empty,
+        {"display": "none"},
+        None,
+        {"display": "none"},
+        empty,
+        empty,
+        empty,
+        empty,
+        {"display": "block", "height": "100%"},
+    )
 
 # Update filter and selection counts for AG Grid
 @callback(

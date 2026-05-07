@@ -1,6 +1,8 @@
 import logging
 import os
 import re
+import uuid
+from datetime import datetime, timezone
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -158,13 +160,22 @@ def get_table_columns(table_name):
         with engine.connect() as connection:
             df = pd.read_sql_query(query, connection, params={"table_name": validated_table})
     except Exception as exc:
-        raise DatabaseAccessError(f"Unable to load columns for '{validated_table}': {exc}") from exc
+        logger.warning("Unable to load INFORMATION_SCHEMA columns for %s; falling back to source columns.", validated_table)
+        try:
+            preview_df = get_table_preview(validated_table, limit=1)
+            return preview_df.columns.tolist()
+        except Exception as fallback_exc:
+            raise DatabaseAccessError(f"Unable to load columns for '{validated_table}': {fallback_exc}") from fallback_exc
     finally:
         if engine is not None:
             engine.dispose()
 
     if df.empty:
-        raise DatabaseAccessError(f"Table '{validated_table}' does not expose any columns.")
+        try:
+            preview_df = get_table_preview(validated_table, limit=1)
+            return preview_df.columns.tolist()
+        except Exception as fallback_exc:
+            raise DatabaseAccessError(f"Table '{validated_table}' does not expose any columns.") from fallback_exc
 
     return df["COLUMN_NAME"].tolist()
 
@@ -172,7 +183,14 @@ def get_table_columns(table_name):
 def get_table_schema_preview(table_name):
     validated_table = _validate_table_name(table_name)
     query = """
-    SELECT COLUMN_NAME, DATA_TYPE
+    SELECT
+        ORDINAL_POSITION,
+        COLUMN_NAME,
+        DATA_TYPE,
+        IS_NULLABLE,
+        CHARACTER_MAXIMUM_LENGTH,
+        NUMERIC_PRECISION,
+        NUMERIC_SCALE
     FROM INFORMATION_SCHEMA.COLUMNS
     WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = :table_name
     ORDER BY ORDINAL_POSITION
@@ -181,12 +199,41 @@ def get_table_schema_preview(table_name):
     try:
         engine = get_engine()
         with engine.connect() as connection:
-            return pd.read_sql_query(query, connection, params={"table_name": validated_table})
+            df = pd.read_sql_query(query, connection, params={"table_name": validated_table})
     except Exception as exc:
-        raise DatabaseAccessError(f"Unable to load schema for '{validated_table}': {exc}") from exc
+        logger.warning("Unable to load INFORMATION_SCHEMA for %s; falling back to source columns.", validated_table)
+        df = pd.DataFrame()
     finally:
         if engine is not None:
             engine.dispose()
+
+    if df is not None and not df.empty:
+        df["SCHEMA_SOURCE"] = "INFORMATION_SCHEMA"
+        return df
+
+    try:
+        preview_df = get_table_preview(validated_table, limit=1)
+    except Exception as exc:
+        raise DatabaseAccessError(f"Unable to load schema for '{validated_table}': {exc}") from exc
+
+    fallback = pd.DataFrame(
+        [
+            {
+                "ORDINAL_POSITION": index + 1,
+                "COLUMN_NAME": column,
+                "DATA_TYPE": "unavailable",
+                "IS_NULLABLE": "YES",
+                "CHARACTER_MAXIMUM_LENGTH": None,
+                "NUMERIC_PRECISION": None,
+                "NUMERIC_SCALE": None,
+                "SCHEMA_SOURCE": "SOURCE_PREVIEW",
+            }
+            for index, column in enumerate(preview_df.columns.tolist())
+        ]
+    )
+    if fallback.empty:
+        raise DatabaseAccessError(f"Table '{validated_table}' does not expose any columns.")
+    return fallback
 
 
 def get_table_preview(table_name, limit=1):
@@ -219,6 +266,12 @@ def get_column_distinct_values(table_name, column, limit=200):
     """
     df = fetch_query_dataframe(query)
     return df["value"].tolist() if not df.empty else []
+
+
+def get_holding_table_name(source_table):
+    validated_table = _validate_table_name(source_table)
+    clean = re.sub(r"[^A-Za-z0-9_]+", "_", validated_table).strip("_").lower()
+    return f"upload_holding_{clean}"
 
 
 def fetch_table_rows(table_name, columns, start_row=1, row_count=100, max_rows=None, filters=None):
@@ -261,12 +314,12 @@ def fetch_table_rows(table_name, columns, start_row=1, row_count=100, max_rows=N
     return fetch_query_dataframe(query)
 
 
-def append_dataframe_to_table(table_name, df):
+def validate_upload_dataframe(table_name, df):
     validated_table = _validate_table_name(table_name)
     expected_columns = get_table_columns(validated_table)
 
     if df.empty:
-        raise DatabaseAccessError("The uploaded CSV contains no data rows.")
+        raise DatabaseAccessError("The uploaded workbook contains no data rows.")
 
     if len(df.columns) != len(expected_columns):
         raise DatabaseAccessError(
@@ -274,12 +327,18 @@ def append_dataframe_to_table(table_name, df):
         )
     if list(df.columns) != expected_columns:
         raise DatabaseAccessError(
-            "CSV columns must match the destination table exactly and in order. "
+            "Workbook columns must match the destination table exactly and in order. "
             f"Expected: {', '.join(expected_columns)}."
         )
 
     upload_df = df.copy()
     upload_df = upload_df.where(pd.notnull(upload_df), None)
+    return upload_df, expected_columns
+
+
+def append_dataframe_to_table(table_name, df):
+    upload_df, _expected_columns = validate_upload_dataframe(table_name, df)
+    validated_table = _validate_table_name(table_name)
 
     engine = None
     try:
@@ -293,3 +352,41 @@ def append_dataframe_to_table(table_name, df):
             engine.dispose()
 
     return len(upload_df)
+
+
+def append_dataframe_to_holding_table(table_name, df, filename=None):
+    """Append an approved upload into a per-source holding table.
+
+    Holding rows keep the source-shaped data plus traceability columns. They are
+    intentionally separate from production/source tables so uploaded data can be
+    reviewed before any promotion step.
+    """
+    upload_df, _expected_columns = validate_upload_dataframe(table_name, df)
+    validated_table = _validate_table_name(table_name)
+    holding_table = get_holding_table_name(validated_table)
+    batch_id = str(uuid.uuid4())
+    uploaded_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    staged_df = upload_df.copy()
+    staged_df.insert(0, "upload_batch_id", batch_id)
+    staged_df.insert(1, "source_table", validated_table)
+    staged_df.insert(2, "source_filename", filename or "")
+    staged_df.insert(3, "uploaded_at_utc", uploaded_at)
+
+    engine = None
+    try:
+        engine = get_engine("upload")
+        with engine.begin() as connection:
+            staged_df.to_sql(holding_table, connection, if_exists="append", index=False, schema="dbo")
+    except Exception as exc:
+        raise DatabaseAccessError(f"Database upload failed: {exc}") from exc
+    finally:
+        if engine is not None:
+            engine.dispose()
+
+    return {
+        "rows": len(upload_df),
+        "holding_table": f"dbo.{holding_table}",
+        "batch_id": batch_id,
+        "uploaded_at_utc": uploaded_at,
+    }

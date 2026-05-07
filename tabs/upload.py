@@ -9,7 +9,7 @@ import base64
 from dash_ag_grid import AgGrid
 from data_access import (
     DatabaseAccessError,
-    append_dataframe_to_table,
+    append_dataframe_to_holding_table,
     get_allowed_tables,
     get_table_columns,
     get_table_schema_preview,
@@ -72,6 +72,58 @@ def _make_simple_table(df):
         className="simple-data-table-wrap",
     )
 
+
+def _schema_for_display(schema_df):
+    df = schema_df.copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Position", "Column", "Type", "Required", "Structure"])
+
+    def format_type(row):
+        dtype = str(row.get("DATA_TYPE", ""))
+        max_len = row.get("CHARACTER_MAXIMUM_LENGTH")
+        precision = row.get("NUMERIC_PRECISION")
+        scale = row.get("NUMERIC_SCALE")
+        if dtype.lower() in {"varchar", "nvarchar", "char", "nchar", "binary", "varbinary"} and pd.notna(max_len):
+            length = "max" if int(max_len) == -1 else str(int(max_len))
+            return f"{dtype}({length})"
+        if dtype.lower() in {"decimal", "numeric"} and pd.notna(precision):
+            return f"{dtype}({int(precision)},{int(scale or 0)})"
+        return dtype
+
+    display = pd.DataFrame(
+        {
+            "Position": df["ORDINAL_POSITION"] if "ORDINAL_POSITION" in df.columns else range(1, len(df) + 1),
+            "Column": df["COLUMN_NAME"],
+            "Type": df.apply(format_type, axis=1),
+            "Required": df.get("IS_NULLABLE", pd.Series(["YES"] * len(df))).map(lambda v: "Yes" if str(v).upper() == "NO" else "No"),
+            "Notes": df.get("SCHEMA_SOURCE", pd.Series(["INFORMATION_SCHEMA"] * len(df))).map(
+                lambda source: "Type metadata unavailable; column name/order verified from source table."
+                if source == "SOURCE_PREVIEW"
+                else "Keep this exact Excel header and column order."
+            ),
+        }
+    )
+    return display
+
+
+def _build_template_workbook(selected_table, schema_df):
+    columns = schema_df["COLUMN_NAME"].tolist()
+    schema_display = _schema_for_display(schema_df)
+    readme = pd.DataFrame(
+        [
+            {"Item": "Target source table", "Value": selected_table},
+            {"Item": "Required format", "Value": ".xlsx workbook with a Data sheet"},
+            {"Item": "Review flow", "Value": "Rows are staged for review and are not written directly to source tables."},
+        ]
+    )
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(columns=columns).to_excel(writer, index=False, sheet_name="Data")
+        schema_display.to_excel(writer, index=False, sheet_name="Schema")
+        readme.to_excel(writer, index=False, sheet_name="README")
+    output.seek(0)
+    return output.getvalue()
+
 upload_layout = dcc.Tab(
     [
         # Store the tab's active state
@@ -80,7 +132,7 @@ upload_layout = dcc.Tab(
             [
                 html.H4("Upload Data", className="page-title"),
                 html.P(
-                    "Add CSV rows to an approved database table. The file must use the same column names and order shown in the table structure preview.",
+                    "Upload Excel rows for review. Use the template so columns match the selected table.",
                     className="page-intro",
                 ),
             ],
@@ -97,7 +149,7 @@ upload_layout = dcc.Tab(
                             placeholder="Choose a destination table",
                             maxHeight=420,
                         ),
-                        html.P("Choose where these rows should be appended.", className="section-copy"),
+                        html.P("Choose the table format your workbook should follow.", className="section-copy"),
                     ],
                     className="panel-card upload-target-panel",
                 ),
@@ -105,22 +157,30 @@ upload_layout = dcc.Tab(
                     [
                         html.Div(
                             [
-                                html.H6("CSV File", className="section-title"),
+                                html.H6("Excel File", className="section-title"),
+                                html.P("Use a .xlsx workbook with headers that match the template exactly. The first sheet or a sheet named Data will be parsed.", className="section-copy"),
                                 dcc.Upload(
                                     id='upload-csv',
-                                    children=html.Div("Drop a CSV file here or select one"),
+                                    children=html.Div("Drop an .xlsx file here or select one"),
                                     className="upload-dropzone",
                                     multiple=False,
                                 ),
                             ],
                             className="panel-card",
                         ),
+                        html.Div(
+                            [
+                                html.Button("Download .xlsx Template", id="upload-template-button", n_clicks=0, className="btn btn-outline-secondary"),
+                                dcc.Download(id="upload-template-download"),
+                            ],
+                            className="button-row",
+                        ),
                         html.Div(id="table-structure-info"),
                         html.Div(id="upload-status"),
                         html.Div(id="csv-preview"),
                         html.Div(
                             [
-                                html.Button("Upload to Database", id="upload-button", disabled=True, className="btn btn-success"),
+                                html.Button("Upload to Holding Table", id="upload-button", disabled=True, className="btn btn-success"),
                             ],
                             className="button-row",
                         ),
@@ -184,17 +244,27 @@ def display_table_structure(selected_table):
         return []
     
     try:
-        # Get a sample row to determine columns and types
         schema_df = get_table_schema_preview(selected_table)
+        schema_display = _schema_for_display(schema_df)
         
-        # Create table structure information
         structure_info = [
-            html.H6("Destination Table Structure", className="section-title"),
-            html.P(f"This table has {len(schema_df)} columns. Your CSV must match this order.", className="section-copy"),
+            html.H6("Expected Upload Structure", className="section-title"),
+            html.P(
+                f"This upload type expects {len(schema_display)} columns. Keep the Excel headers and order exactly as shown.",
+                className="section-copy",
+            ),
+            html.P(
+                "If database type metadata is unavailable, the preview still shows the verified source columns and marks type details as unavailable.",
+                className="section-copy",
+            ),
+            html.P(
+                "Uploaded rows are staged for review before they are added to source data.",
+                className="section-copy",
+            ),
             _make_grid(
-                schema_df.rename(columns={"COLUMN_NAME": "Column", "DATA_TYPE": "Data Type"}),
+                schema_display,
                 "upload-schema-grid",
-                height=280,
+                height=340,
             ),
         ]
         
@@ -203,24 +273,28 @@ def display_table_structure(selected_table):
         logger.exception("Unable to load upload table structure for %s", selected_table)
         return _status("Table structure is unavailable right now. Choose another table or try again later.", "warning", "Table structure unavailable")
 
-# Function to parse CSV content
-def parse_csv(contents):
+def parse_excel(contents, filename=None):
     if contents is None:
         return None, None
-    content_type, content_string = contents.split(',')
+    if not (filename or "").lower().endswith(".xlsx"):
+        return None, "Uploads must be Excel .xlsx files. Download the template and save your rows as .xlsx before uploading."
+
+    content_type, content_string = contents.split(',', 1)
     decoded = base64.b64decode(content_string)
     
     try:
-        decoded_text = decoded.decode('utf-8-sig')
-        df = pd.read_csv(io.StringIO(decoded_text))
+        workbook = pd.ExcelFile(io.BytesIO(decoded), engine="openpyxl")
+        sheet_name = "Data" if "Data" in workbook.sheet_names else workbook.sheet_names[0]
+        df = pd.read_excel(workbook, sheet_name=sheet_name)
+        df = df.dropna(how="all")
         if df.empty:
-            return None, "The CSV was read successfully but contains no data rows."
+            return None, "The Excel workbook was read successfully but contains no data rows."
         return df, None
     except Exception as e:
-        logger.exception("Unable to parse uploaded CSV")
-        return None, "The CSV could not be read. Confirm it is a valid comma-separated file with a header row."
+        logger.exception("Unable to parse uploaded Excel workbook")
+        return None, "The Excel file could not be read. Confirm it is a valid .xlsx workbook with a header row."
 
-# Callback to validate CSV file and display preview
+# Callback to validate Excel file and display preview
 @callback(
     [Output("csv-preview", "children"),
      Output("upload-status", "children"),
@@ -236,27 +310,23 @@ def validate_and_preview_csv(contents, selected_table, filename):
     try:
         table_columns = get_table_columns(selected_table)
         
-        # Parse the uploaded CSV
-        df, error = parse_csv(contents)
+        df, error = parse_excel(contents, filename)
         if error:
-            return [], _status(error, "error", "CSV could not be read"), True
+            return [], _status(error, "error", "Excel file could not be read"), True
         
         # Verify column names and order match. The database insert maps by name now,
-        # so this prevents silent misloads when a same-width CSV is arranged differently.
+        # so this prevents silent misloads when a same-width workbook is arranged differently.
         if len(df.columns) != len(table_columns):
             return get_preview_table(df), html.Div([
                 html.H6("Validation Error", className="section-title"),
-                html.P(
-                    f"{filename or 'This CSV'} has {len(df.columns)} columns, but '{selected_table}' expects {len(table_columns)}.",
-                    className="section-copy",
-                ),
+                html.P(f"{filename or 'This workbook'} has {len(df.columns)} columns, but '{selected_table}' expects {len(table_columns)}.", className="section-copy"),
                 html.P("Column counts must match to proceed.", className="section-copy"),
                 html.P(f"Expected order: {', '.join(table_columns)}", className="section-copy")
             ], className="status-error"), True
         if list(df.columns) != table_columns:
             return get_preview_table(df), html.Div([
                 html.H6("Validation Error", className="section-title"),
-                html.P("Column names and order must match the destination table before upload.", className="section-copy"),
+                html.P("Column names and order must match the template before upload.", className="section-copy"),
                 html.P(f"Expected order: {', '.join(table_columns)}", className="section-copy"),
                 html.P(f"Uploaded order: {', '.join(map(str, df.columns))}", className="section-copy")
             ], className="status-error"), True
@@ -266,17 +336,17 @@ def validate_and_preview_csv(contents, selected_table, filename):
             warning = html.Div([
                 html.H6("Ready with Warnings", className="section-title"),
                 html.P(
-                    f"{filename or 'This CSV'} has {missing_rows} row(s) with missing values. Empty cells will be uploaded as NULL.",
+                    f"{filename or 'This workbook'} has {missing_rows} row(s) with missing values. Empty cells will be uploaded as NULL.",
                     className="section-copy",
                 ),
                 html.P(f"Expected destination columns: {', '.join(table_columns)}", className="section-copy"),
-                html.P("Preview below shows data as it will be uploaded.", className="section-copy")
+                html.P("Preview below shows the rows that will be staged for review.", className="section-copy")
             ], className="status-warning")
         else:
             warning = html.Div([
                 html.H6("Ready to Upload", className="section-title"),
-                html.P(f"{filename or 'This CSV'} with {len(df)} rows is ready for '{selected_table}'.", className="section-copy"),
-                html.P(f"Expected destination columns: {', '.join(table_columns)}", className="section-copy")
+                html.P(f"{filename or 'This workbook'} with {len(df)} rows is ready to stage for review.", className="section-copy"),
+                html.P(f"Expected source columns: {', '.join(table_columns)}", className="section-copy")
             ], className="status-success")
         
         return get_preview_table(df), warning, False
@@ -293,7 +363,7 @@ def get_preview_table(df):
     return [
         html.Div(
             [
-                html.H6("CSV Preview", className="section-title"),
+                html.H6("Excel Preview", className="section-title"),
                 html.P(f"Showing first {preview_rows} of {len(df)} rows.", className="section-copy"),
                 _make_simple_table(df_preview),
             ],
@@ -313,20 +383,44 @@ def upload_to_database(n_clicks, contents, selected_table, filename):
         raise PreventUpdate
     
     try:
-        df, error = parse_csv(contents)
+        df, error = parse_excel(contents, filename)
         if error:
             return _status(error, "error", "Upload Error")
         
-        uploaded_rows = append_dataframe_to_table(selected_table, df)
+        upload_result = append_dataframe_to_holding_table(selected_table, df, filename=filename)
         
         return html.Div([
-            html.H6("Upload Successful", className="section-title"),
+            html.H6("Upload Staged", className="section-title"),
             html.P(
-                f"Successfully uploaded {uploaded_rows} rows from '{filename or 'uploaded file'}' to '{selected_table}'.",
+                f"Staged {upload_result['rows']} rows from '{filename or 'uploaded file'}' for review.",
                 className="section-copy",
-            )
+            ),
         ], className="status-success")
         
     except DatabaseAccessError as e:
-        logger.exception("Unable to upload CSV to %s", selected_table)
-        return _status("Upload failed before rows were added. Check that the file still matches the destination table and try again.", "error", "Upload Error")
+        logger.exception("Unable to stage Excel upload for %s", selected_table)
+        return _status("Upload failed before rows were staged. Check that the workbook still matches the template and try again.", "error", "Upload Error")
+
+
+@callback(
+    Output("upload-template-download", "data"),
+    Input("upload-template-button", "n_clicks"),
+    State("upload_table_dropdown", "value"),
+    prevent_initial_call=True,
+)
+def download_upload_template(n_clicks, selected_table):
+    if not n_clicks or not selected_table:
+        raise PreventUpdate
+
+    try:
+        schema_df = get_table_schema_preview(selected_table)
+        workbook_bytes = _build_template_workbook(selected_table, schema_df)
+        filename = f"{selected_table}_upload_template.xlsx"
+        return dcc.send_bytes(
+            workbook_bytes,
+            filename,
+            type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except DatabaseAccessError:
+        logger.exception("Unable to generate upload template for %s", selected_table)
+        raise PreventUpdate
