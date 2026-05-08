@@ -93,7 +93,11 @@ download_layout = dcc.Tab(
             ],
             className="page-header-block",
         ),
-        html.Div(id="download-table-overview", className="file-table-grid"),
+        dcc.Loading(
+            id="download-overview-loading",
+            type="default",
+            children=html.Div(id="download-table-overview", className="file-table-grid"),
+        ),
         html.Div(
             [
                 html.Div(
@@ -125,6 +129,7 @@ download_layout = dcc.Tab(
                                     id="download-row-limit-controls",
                                     className="inline-controls",
                                 ),
+                                html.Div(id="download-limit-warning"),
                             ],
                             className="panel-card",
                         ),
@@ -166,11 +171,23 @@ download_layout = dcc.Tab(
                             ],
                             className="button-row",
                         ),
-                        html.Div(id="download-status"),
+                        html.Div(
+                            "Downloads include all rows for the selected table. Row limits only affect the preview.",
+                            className="section-copy",
+                        ),
+                        dcc.Loading(
+                            id="download-status-loading",
+                            type="default",
+                            children=html.Div(id="download-status"),
+                        ),
                         html.Div(
                             [
                                 html.H5("Preview Rows", className="section-title"),
-                                html.Div(id="download-preview"),
+                                dcc.Loading(
+                                    id="download-preview-loading",
+                                    type="default",
+                                    children=html.Div(id="download-preview"),
+                                ),
                             ],
                             className="panel-card",
                         ),
@@ -271,7 +288,7 @@ def update_column_options(selected_table):
         
         total_rows = _get_table_row_count_direct(selected_table)
         
-        row_info = f"{total_rows:,} rows available in this table. The preview only shows a small slice so the page stays fast."
+        row_info = f"{total_rows:,} rows available in this table."
         
         # Return all columns selected by default
         return column_options, columns, row_info, total_rows
@@ -330,13 +347,33 @@ def update_filter_values(selected_table, filter_column):
 
 
 @callback(
-    Output("download-row-limit-controls", "style"),
+    [Output("download-row-limit-controls", "style"),
+     Output("download-limit-warning", "children")],
     Input("download-limit-toggle", "value")
 )
 def toggle_download_row_limits(limit_toggle):
     if limit_toggle and "limit" in limit_toggle:
-        return {"display": "flex"}
-    return {"display": "none"}
+        return {"display": "flex"}, None
+    return {"display": "none"}, html.Div(
+        "Row limiting is off. Previewing the full table may take time for large datasets.",
+        className="status-warning compact-warning",
+    )
+
+
+@callback(
+    Output("download-button", "children"),
+    Input("download_table_dropdown", "value")
+)
+def update_download_button_label(selected_table):
+    if not selected_table:
+        return "Download Flat File"
+
+    try:
+        total_rows = _get_table_row_count_direct(selected_table)
+        return f"Download Entire Dataset ({total_rows:,} rows)"
+    except DatabaseAccessError:
+        logger.exception("Unable to count rows for %s while labeling download button", selected_table)
+        return "Download Entire Dataset"
 
 # Callback to show data preview
 @callback(
@@ -362,9 +399,15 @@ def update_preview(n_clicks, selected_table, start_row, end_row, selected_column
         if not end_row or end_row < start_row:
             end_row = start_row + 99
         row_count = end_row - start_row + 1
+        preview_max_rows = row_count
     else:
         start_row = 1
-        row_count = 100
+        try:
+            row_count = _get_table_row_count_direct(selected_table)
+        except DatabaseAccessError:
+            logger.exception("Unable to count rows for %s before full preview", selected_table)
+            return _friendly_error(), html.Div("Preview could not be generated.", className="section-copy")
+        preview_max_rows = row_count
 
     filters = {filter_column: filter_values} if filter_column and filter_values else None
     
@@ -374,19 +417,35 @@ def update_preview(n_clicks, selected_table, start_row, end_row, selected_column
             selected_columns,
             start_row=start_row,
             row_count=row_count,
-            max_rows=100,
+            max_rows=preview_max_rows,
             filters=filters,
         )
 
         if preview_df.empty:
             return _empty_state("No rows matched this range or filter."), html.Div("Adjust the row range or clear filters.", className="section-copy")
         
-        preview = [
-            html.P(f"Previewing {len(preview_df):,} rows. Sort or filter columns inside the grid.", className="section-copy"),
+        requested_text = (
+            f"rows {start_row:,}-{end_row:,}"
+            if use_limit
+            else "the entire dataset"
+        )
+        preview = []
+        if not use_limit:
+            preview.append(
+                html.Div(
+                    "Row limiting is off. Loading the full preview may take time for large tables.",
+                    className="status-warning",
+                )
+            )
+        preview.extend([
+            html.P(
+                f"Previewing {len(preview_df):,} rows from {requested_text}. Sort or filter columns inside the grid.",
+                className="section-copy",
+            ),
             _make_grid(preview_df, "download-preview-grid"),
-        ]
+        ])
         status = html.Div(
-            f"Previewing up to 100 rows for {selected_table}. Filters are applied before the row limit.",
+            f"Preview loaded for {selected_table}. Filters are applied before the row range.",
             className="section-copy",
         )
         return preview, status
@@ -400,34 +459,19 @@ def update_preview(n_clicks, selected_table, start_row, end_row, selected_column
      Output("download-status", "children", allow_duplicate=True)],
     [Input("download-button", "n_clicks")],
     [State("download_table_dropdown", "value"),
-     State("download-start-row", "value"),
-     State("download-end-row", "value"),
-     State("download-columns", "value"),
-     State("download-limit-toggle", "value"),
-     State("download-filter-column", "value"),
-     State("download-filter-values", "value")],
+     State("download-columns", "value")],
     prevent_initial_call=True
 )
-def download_csv(n_clicks, selected_table, start_row, end_row, selected_columns, limit_toggle, filter_column, filter_values):
+def download_csv(n_clicks, selected_table, selected_columns):
     if not n_clicks or not selected_table or not selected_columns:
         raise PreventUpdate
-    
-    use_limit = limit_toggle and "limit" in limit_toggle
-    if use_limit:
-        if not start_row or start_row < 1:
-            start_row = 1
-        if not end_row or end_row < start_row:
-            end_row = start_row + 999
-        row_count = end_row - start_row + 1
-    else:
-        start_row = 1
-        try:
-            row_count = _get_table_row_count_direct(selected_table)
-        except DatabaseAccessError:
-            logger.exception("Unable to count rows for %s before download", selected_table)
-            return None, _friendly_error("Download unavailable")
 
-    filters = {filter_column: filter_values} if filter_column and filter_values else None
+    start_row = 1
+    try:
+        row_count = _get_table_row_count_direct(selected_table)
+    except DatabaseAccessError:
+        logger.exception("Unable to count rows for %s before download", selected_table)
+        return None, _friendly_error("Download unavailable")
     
     try:
         df = fetch_table_rows(
@@ -435,16 +479,15 @@ def download_csv(n_clicks, selected_table, start_row, end_row, selected_columns,
             selected_columns,
             start_row=start_row,
             row_count=row_count,
-            filters=filters,
         )
         
         if df.empty:
-            return None, html.Div("No rows matched that range.", style={"color": "#8a6d3b"})
+            return None, html.Div("No rows are available for this table.", style={"color": "#8a6d3b"})
 
-        filename = f"{selected_table}_rows_{start_row}_to_{start_row + len(df) - 1}.csv"
+        filename = f"{selected_table}_all_rows.csv"
         return (
             dcc.send_data_frame(df.to_csv, filename, index=False),
-            html.Div(f"Prepared {len(df)} rows for download.", style={"color": "#666"}),
+            html.Div(f"Prepared the entire dataset for download ({len(df):,} rows).", style={"color": "#666"}),
         )
     except DatabaseAccessError as e:
         logger.exception("Unable to download flat file for %s", selected_table)

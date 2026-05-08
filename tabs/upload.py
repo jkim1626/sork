@@ -170,16 +170,32 @@ upload_layout = dcc.Tab(
                             ],
                             className="button-row",
                         ),
-                        html.Div(id="table-structure-info"),
-                        html.Div(id="upload-status"),
-                        html.Div(id="csv-preview"),
+                        dcc.Loading(
+                            id="upload-structure-loading",
+                            type="default",
+                            children=html.Div(id="table-structure-info"),
+                        ),
+                        dcc.Loading(
+                            id="upload-status-loading",
+                            type="default",
+                            children=html.Div(id="upload-status"),
+                        ),
+                        dcc.Loading(
+                            id="upload-preview-loading",
+                            type="default",
+                            children=html.Div(id="csv-preview"),
+                        ),
                         html.Div(
                             [
                                 html.Button("Upload to Holding Table", id="upload-button", disabled=True, className="btn btn-success"),
                             ],
                             className="button-row",
                         ),
-                        html.Div(id="upload-result"),
+                        dcc.Loading(
+                            id="upload-result-loading",
+                            type="default",
+                            children=html.Div(id="upload-result"),
+                        ),
                     ],
                     id="upload-container",
                     className="upload-workspace",

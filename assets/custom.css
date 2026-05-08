@@ -541,6 +541,12 @@ button.login-button {
     border: 1px solid #ead38c;
 }
 
+.compact-warning {
+    padding: 8px 10px;
+    margin: 8px 0 0;
+    font-size: 0.9rem;
+}
+
 .status-error {
     background: #fff0f0;
     border: 1px solid #efc1c1;
