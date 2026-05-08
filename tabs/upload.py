@@ -96,11 +96,6 @@ def _schema_for_display(schema_df):
             "Column": df["COLUMN_NAME"],
             "Type": df.apply(format_type, axis=1),
             "Required": df.get("IS_NULLABLE", pd.Series(["YES"] * len(df))).map(lambda v: "Yes" if str(v).upper() == "NO" else "No"),
-            "Notes": df.get("SCHEMA_SOURCE", pd.Series(["INFORMATION_SCHEMA"] * len(df))).map(
-                lambda source: "Type metadata unavailable; column name/order verified from source table."
-                if source == "SOURCE_PREVIEW"
-                else "Keep this exact Excel header and column order."
-            ),
         }
     )
     return display

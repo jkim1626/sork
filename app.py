@@ -105,12 +105,12 @@ FLAT_FILE_SUBTAB_STYLE = {
     "cursor": "pointer",
     "display": "inline-flex",
     "fontWeight": "700",
-    "height": "30px",
+    "height": "38px",
     "justifyContent": "center",
     "lineHeight": "1.2",
-    "minWidth": "0",
-    "maxWidth": "150px",
-    "padding": "0 10px",
+    "minWidth": "150px",
+    "maxWidth": "190px",
+    "padding": "0 18px",
 }
 
 FLAT_FILE_SUBTAB_SELECTED_STYLE = {
@@ -142,7 +142,9 @@ flat_files_layout = dcc.Tab(
                     selected_style=FLAT_FILE_SUBTAB_SELECTED_STYLE,
                 ),
             ],
-            style={"display": "flex", "flex": "1 1 auto", "flexDirection": "column"},
+            vertical=False,
+            mobile_breakpoint=0,
+            style={"display": "flex", "flexDirection": "row", "alignItems": "center", "justifyContent": "center", "gap": "10px", "width": "100%"},
             parent_style={"display": "flex", "flex": "1 1 auto", "flexDirection": "column"},
             className="flat-files-subtabs",
             parent_className="flat-files-subtabs__parent",
@@ -276,6 +278,10 @@ def serve_layout():
         
 
 app.layout = serve_layout
+app.validation_layout = html.Div([
+    build_authenticated_layout(),
+    html.Div(id="error-message"),
+])
 
 
 

@@ -659,12 +659,13 @@ button.login-button {
 .flat-files-subtabs > div:first-child {
     display: flex !important;
     flex-direction: row !important;
+    flex-wrap: nowrap !important;
     align-items: center;
     justify-content: center !important;
-    gap: 6px;
+    gap: 10px;
     width: 100% !important;
-    min-height: 38px;
-    padding: 3px;
+    min-height: 50px;
+    padding: 6px;
     margin-bottom: 14px;
     background: #eef4ec;
     border: 1px solid rgba(23, 52, 33, 0.16);
@@ -677,22 +678,36 @@ button.login-button {
     display: inline-flex !important;
     align-items: center !important;
     justify-content: center !important;
-    min-height: 30px !important;
-    height: 30px !important;
-    min-width: 98px !important;
-    max-width: 128px !important;
-    width: auto !important;
-    padding: 0 10px !important;
+    align-self: center !important;
+    min-height: 38px !important;
+    height: 38px !important;
+    max-height: 38px !important;
+    min-width: 150px !important;
+    max-width: 190px !important;
+    width: 170px !important;
+    padding: 0 18px !important;
     border: 1px solid rgba(33, 79, 51, 0.12) !important;
     border-radius: 6px !important;
     background: rgba(255, 255, 255, 0.54) !important;
     color: var(--shell-accent-dark) !important;
     font-weight: 700;
-    font-size: 0.82rem;
+    font-size: 0.9rem;
     line-height: 1.2 !important;
     cursor: pointer;
     white-space: nowrap;
+    margin: 0 !important;
+    vertical-align: top !important;
     transition: background-color 160ms ease, color 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.flat-files-subtabs .tab span,
+.flat-files-subtabs .tab div {
+    display: inline-flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    line-height: 1.2 !important;
+    margin: 0 !important;
+    padding: 0 !important;
 }
 
 .flat-files-subtabs .tab:hover {

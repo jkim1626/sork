@@ -1,5 +1,4 @@
 import logging
-
 from dash import dcc, html, Input, Output, State, callback, ctx, clientside_callback
 from dash.exceptions import PreventUpdate
 import dash
@@ -66,6 +65,13 @@ CORE_JOIN_KEYS_BY_TABLE = {
 DEFAULT_CORE_JOIN_KEYS = ["Accession", "Locality", "Year", "Site"]
 TREE_JOIN_KEYS = {"Accession", "Locality"}
 GARDEN_JOIN_KEYS = {"Site", "Year"}
+CALCULATED_COLUMN_OPERATIONS = [
+    {"label": "Add", "value": "add"},
+    {"label": "Subtract", "value": "subtract"},
+    {"label": "Multiply", "value": "multiply"},
+    {"label": "Divide", "value": "divide"},
+    {"label": "Difference from mean (one variable)", "value": "center"},
+]
 
 # Whitelists for validation
 ALLOWED_CORE_TABLES = set(CORE_TABLES.keys())
@@ -94,6 +100,75 @@ def _garden_join_validation_message(core_table, core_columns=None, garden_column
             return f"Garden Climate joins by Site + Year, but the Garden Climate table does not expose: {', '.join(missing_garden)}."
     return None
 
+
+def _is_numeric_like(series):
+    try:
+        if is_numeric_dtype(series):
+            return True
+        sample = pd.to_numeric(series.dropna().head(TYPE_DETECTION_SAMPLE_SIZE), errors='coerce')
+        return len(sample) > 0 and sample.notna().sum() / float(len(sample)) >= NUMERIC_THRESHOLD
+    except Exception:
+        return False
+
+
+def _column_category(column_name, series):
+    name = str(column_name).lower()
+    if any(token in name for token in ("id", "site", "year", "month", "date", "accession", "locality", "tree", "plot", "sample")):
+        return "Identifier"
+    if _is_numeric_like(series):
+        return "Numeric"
+    try:
+        if series.dropna().nunique() <= 25:
+            return "Category"
+    except Exception:
+        pass
+    return "Other"
+
+
+def _analysis_option(column_name, series):
+    return {"label": f"{_column_category(column_name, series)}: {column_name}", "value": column_name}
+
+
+def _safe_calculated_column_name(name):
+    cleaned = "".join(c if c.isalnum() or c == "_" else "_" for c in str(name or "").strip()).strip("_")
+    return cleaned or None
+
+
+def _calculated_column_series(df, operation, left_col, right_col=None):
+    if left_col not in df.columns:
+        raise ValueError("Select a valid first variable.")
+    left = pd.to_numeric(df[left_col], errors="coerce")
+
+    if operation == "center":
+        return left - left.mean()
+
+    if operation in {"add", "subtract", "multiply", "divide"}:
+        if right_col not in df.columns:
+            raise ValueError("Select a valid second variable.")
+        right = pd.to_numeric(df[right_col], errors="coerce")
+        if operation == "add":
+            return left + right
+        if operation == "subtract":
+            return left - right
+        if operation == "multiply":
+            return left * right
+        if operation == "divide":
+            return left / right.replace({0: np.nan})
+
+    raise ValueError("Choose a supported calculation.")
+
+
+def _calculated_column_options(column_names):
+    return [{"label": name, "value": name} for name in (column_names or [])]
+
+
+def _remove_column_def(column_defs, column_name):
+    return [
+        col_def
+        for col_def in (column_defs or [])
+        if col_def.get("field") != column_name
+    ]
+
 # Create a layout for the joins tab
 joins_layout = dcc.Tab(
     label="Select and Filter",
@@ -104,6 +179,7 @@ joins_layout = dcc.Tab(
         dcc.Store(id='join-tab-full-query', data=None),  # Store the SQL query instead of data
         dcc.Store(id='joins-metadata-store', data={}),  # Cache metadata (column lists)
         dcc.Store(id='join-available-years', data=[]),  # Store available years for filtering
+        dcc.Store(id='calculated-columns-store', data=[]),
         html.Div(className="d-flex w-100", id="join-split-container", style={"display": "flex", "flex": "1 1 auto", "flexDirection": "row", "alignItems": "stretch", "maxWidth": "98%", "margin": "0 auto", "padding": "0 20px"}, children=[
             # LEFT COLUMN: Selection (Draggable)
             html.Div(id="join-left-pane", style={"flex": "0 0 auto", "width": "30%", "minWidth": "20%", "maxWidth": "85%", "overflowX": "hidden", "overflowY": "auto", "paddingRight": "20px", "height": "100%"}, children=[
@@ -324,13 +400,94 @@ joins_layout = dcc.Tab(
                         html.Span(id='join-filter-count-text', style={"marginRight": "20px", "fontWeight": "bold"}),
                         html.Span(id='join-selected-count-text', style={"fontWeight": "bold", "marginRight": "12px"}),
                     ], style={"marginBottom": "8px"}),
+
+                    html.Div([
+                        html.H5("Calculated Column", style={"marginBottom": "8px", "color": "#133817"}),
+                        html.P(
+                            "Temporary columns are added to this preview, included in filtered CSV downloads, and available for analysis. They are not saved to the database.",
+                            style={"color": "#666", "fontSize": "0.9em", "marginBottom": "10px"},
+                        ),
+                        html.Div([
+                            dcc.Dropdown(id="calculated-column-left", placeholder="First variable", style={"flex": "1 1 0", "minWidth": "180px"}),
+                            html.Div([
+                                dcc.Dropdown(id="calculated-column-right", placeholder="Second variable", style={"width": "100%"}),
+                            ], id="calculated-column-right-wrapper", style={"flex": "1 1 0", "minWidth": "180px"}),
+                            html.Div([
+                                dcc.Dropdown(
+                                    id="calculated-column-operation",
+                                    options=CALCULATED_COLUMN_OPERATIONS,
+                                    value="add",
+                                    clearable=False,
+                                    style={"width": "100%"},
+                                ),
+                            ], style={"flex": "1 1 0", "minWidth": "180px"}),
+                        ], style={"display": "flex", "gap": "10px", "alignItems": "center"}),
+                        html.Div([
+                            dcc.Input(
+                                id="calculated-column-name",
+                                type="text",
+                                placeholder="New column name",
+                                style={"flex": "1 1 240px", "padding": "7px 10px", "border": "1px solid #ccc", "borderRadius": "4px"},
+                            ),
+                            html.Button(
+                                "Add Column",
+                                id="add-calculated-column-button",
+                                n_clicks=0,
+                                style={
+                                    "backgroundColor": "#007bff",
+                                    "color": "white",
+                                    "border": "none",
+                                    "borderRadius": "4px",
+                                    "padding": "7px 14px",
+                                    "fontSize": "14px",
+                                    "cursor": "pointer",
+                                    "whiteSpace": "nowrap",
+                                },
+                            ),
+                        ], style={"display": "flex", "flexWrap": "wrap", "gap": "10px", "alignItems": "center", "marginTop": "10px"}),
+                        html.Div([
+                            dcc.Dropdown(
+                                id="remove-calculated-column-dropdown",
+                                options=[],
+                                placeholder="Calculated column to remove",
+                                style={"flex": "1 1 260px"},
+                            ),
+                            html.Button(
+                                "Remove Column",
+                                id="remove-calculated-column-button",
+                                n_clicks=0,
+                                style={
+                                    "backgroundColor": "#6c757d",
+                                    "color": "white",
+                                    "border": "none",
+                                    "borderRadius": "4px",
+                                    "padding": "7px 14px",
+                                    "fontSize": "14px",
+                                    "cursor": "pointer",
+                                },
+                            ),
+                        ], style={"display": "flex", "flexWrap": "wrap", "gap": "10px", "alignItems": "center", "marginTop": "10px"}),
+                        html.Div(id="calculated-column-status", style={"marginTop": "8px", "fontSize": "0.9em"}),
+                    ], id="calculated-column-panel", style={"marginBottom": "15px", "padding": "12px", "backgroundColor": "#f8fbf9", "border": "1px solid #d8e7dc", "borderRadius": "8px"}),
                     
                     # Loading indicator - wraps placeholder that gets replaced with grid
                     dcc.Loading(
                         id="join-grid-loading",
                         type="default",
                         children=html.Div(id="join-grid-wrapper", style={"backgroundColor": "#e5ecf6", 
-                                 "padding": "10px", "borderRadius": "5px", "border": "1px solid #d1d1d1", "marginBottom": "15px"})
+                                 "padding": "10px", "borderRadius": "5px", "border": "1px solid #d1d1d1", "marginBottom": "15px"}, children=[
+                            AgGrid(
+                                id='join-tab-grid',
+                                rowData=[],
+                                columnDefs=[],
+                                defaultColDef={'filter': True, 'sortable': True, 'resizable': True},
+                                dashGridOptions={'rowSelection': 'multiple', 'rowMultiSelectWithClick': True},
+                                selectedRows=[],
+                                className='ag-theme-alpine',
+                                style={'width': '100%', 'height': '1px', 'display': 'none'},
+                                enableEnterpriseModules=False,
+                            )
+                        ])
                     ),
                     
                     # Stats and download section
@@ -909,10 +1066,18 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars, year_filt
     
     # Core table info
     core_name = CORE_TABLES.get(core_table, core_table)
-    core_count = len(core_vars) if core_vars else 0
+    if core_vars:
+        core_count = len(core_vars)
+        core_label = f"{core_count} columns selected"
+    elif not tree_vars and not garden_vars:
+        core_count = None
+        core_label = "Full dataset view"
+    else:
+        core_count = 0
+        core_label = "0 columns selected"
     preview_parts.append(html.Div([
         html.Strong(f"{core_name}:"), 
-        html.Span(f" {core_count} columns selected", style={"marginLeft": "10px"})
+        html.Span(f" {core_label}", style={"marginLeft": "10px"})
     ], style={"marginBottom": "8px"}))
     
     # Pre-join filter info
@@ -961,7 +1126,7 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars, year_filt
     
     if not core_vars and not tree_vars and not garden_vars:
         preview_parts.append(html.Div([
-            html.Span("Select at least one variable to preview results.", style={"color": "#856404", "fontStyle": "italic"})
+            html.Span("No join variables selected. The full dataset will be shown.", style={"color": "#856404", "fontStyle": "italic"})
         ]))
     
     return preview_parts, {"display": "block", "marginBottom": "20px", "padding": "15px", 
@@ -992,7 +1157,7 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars, year_filt
     prevent_initial_call=True,
 )
 def execute_join(n_clicks, core_table, core_table_vars, maternal_tree_vars, garden_climate_vars, year_filter, site_filter):
-    if not n_clicks or not core_table or (not core_table_vars and not maternal_tree_vars and not garden_climate_vars):
+    if not n_clicks or not core_table:
         raise PreventUpdate
 
     try:
@@ -1016,9 +1181,15 @@ def execute_join(n_clicks, core_table, core_table_vars, maternal_tree_vars, gard
                 return None, dash.no_update, {"display": "none"}, {"display": "none"}, "Join Data & View Results", False, garden_error, 100, {"display": "block", "height": "100%"}
 
         # 2) Core SELECT
-        core_cols = required_core_cols[:]
         if core_table_vars:
+            core_cols = required_core_cols[:]
             core_cols += [c for c in core_table_vars if c not in core_cols]
+        elif not maternal_tree_vars and not garden_climate_vars:
+            core_cols = core_columns[:]
+        else:
+            core_cols = required_core_cols[:]
+        if not core_cols:
+            core_cols = core_columns[:] if core_columns else required_core_cols[:]
         core_sel = ", ".join(f"core.[{c}]" for c in core_cols)
         selected_clauses = [core_sel]
 
@@ -1133,6 +1304,10 @@ def toggle_row_count_input(limit_toggle):
      Output('join-download-warning', 'children'),
      Output('join-tab-results-div', 'style', allow_duplicate=True),
      Output('join-row-count-container', 'style', allow_duplicate=True),
+     Output('calculated-columns-store', 'data', allow_duplicate=True),
+     Output('remove-calculated-column-dropdown', 'options', allow_duplicate=True),
+     Output('remove-calculated-column-dropdown', 'value', allow_duplicate=True),
+     Output('calculated-column-status', 'children', allow_duplicate=True),
      Output('join-right-placeholder', 'style', allow_duplicate=True)],
     [Input('join-tab-full-query', 'data'),
      Input('join-row-count', 'value'),
@@ -1174,7 +1349,7 @@ FROM (
 
         if result_df is None or result_df.empty:
             empty_div = html.Div("No results returned", style={"padding": "20px", "textAlign": "center", "color": "#666"})
-            return empty_div, "No results returned", "", 1000000, dash.no_update, dash.no_update, html.Div(), {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, {"display": "block", "marginBottom": "15px"}, {"display": "none"}
+            return empty_div, "No results returned", "", 1000000, dash.no_update, dash.no_update, html.Div(), {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, {"display": "block", "marginBottom": "15px"}, [], [], None, html.Div(), {"display": "none"}
 
         # Pull the total count and then drop the helper column so it doesn't show in the grid/downloads
         total_count = 0
@@ -1313,13 +1488,13 @@ FROM (
                 "marginBottom": "10px"
             })
 
-        return grid_component, stats_text, max_rows_text, max_val, filtered_btn_text, full_btn_text, download_warning, {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, {"display": "block", "marginBottom": "15px"}, {"display": "none"}
+        return grid_component, stats_text, max_rows_text, max_val, filtered_btn_text, full_btn_text, download_warning, {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, {"display": "block", "marginBottom": "15px"}, [], [], None, html.Div(), {"display": "none"}
 
     except Exception as e:
         logger.exception("Unable to update Select and Filter grid")
         error_msg = "Results are unavailable right now. Try a smaller preview or adjust your filters."
         error_div = html.Div(error_msg, className="status-warning")
-        return error_div, "", "", 1000000, dash.no_update, dash.no_update, html.Div(), {"display": "none"}, {"display": "none"}, {"display": "block", "height": "100%"}
+        return error_div, "", "", 1000000, dash.no_update, dash.no_update, html.Div(), {"display": "none"}, {"display": "none"}, [], [], None, html.Div(), {"display": "block", "height": "100%"}
 
 # Reset results when any selection changes
 @callback(
@@ -1338,6 +1513,10 @@ FROM (
      Output("pca-output-content", "children", allow_duplicate=True),
      Output("summary-output-content", "children", allow_duplicate=True),
      Output("pd-output-content", "children", allow_duplicate=True),
+     Output("calculated-column-status", "children", allow_duplicate=True),
+     Output("calculated-columns-store", "data", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "options", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "value", allow_duplicate=True),
      Output("join-right-placeholder", "style", allow_duplicate=True)],
     [Input("join-core-table-options", "value"),
      Input("join-tree-table-options", "value"),
@@ -1365,6 +1544,10 @@ def reset_results_on_selection_change(core_vars, tree_vars, garden_vars, year_fi
         empty,
         empty,
         empty,
+        empty,
+        [],
+        [],
+        None,
         {"display": "block", "height": "100%"},
     )
 
@@ -1517,11 +1700,6 @@ def show_error_message(n_clicks, core_table_vars, maternal_tree_vars, garden_cli
         raise PreventUpdate
     
     # Show error message if no variables are selected anywhere.
-    if not core_table_vars and not maternal_tree_vars and not garden_climate_vars:
-        return {"display": "block", "textAlign": "center", "marginTop": "20px",
-                "padding": "15px", "backgroundColor": "#fff3cd", 
-                "borderRadius": "8px", "border": "1px solid #ffc107"}
-    
     return {"display": "none"}
 
 # ====== STATISTICAL CALLBACKS ======
@@ -1534,6 +1712,8 @@ def show_error_message(n_clicks, core_table_vars, maternal_tree_vars, garden_cli
      Output("summary-variable", "options"),
      Output("pd-x-variable", "options"),
      Output("pd-y-variable", "options"),
+     Output("calculated-column-left", "options"),
+     Output("calculated-column-right", "options"),
      Output("stats-test-dropdown", "value"),
      Output("lr-x-variable", "value"),
      Output("lr-y-variable", "value"),
@@ -1541,6 +1721,10 @@ def show_error_message(n_clicks, core_table_vars, maternal_tree_vars, garden_cli
      Output("summary-variable", "value"),
      Output("pd-x-variable", "value"),
      Output("pd-y-variable", "value"),
+     Output("calculated-column-left", "value"),
+     Output("calculated-column-right", "value"),
+     Output("calculated-column-name", "value"),
+     Output("calculated-column-status", "children", allow_duplicate=True),
      Output("lr-output-content", "children", allow_duplicate=True),
      Output("pca-output-content", "children", allow_duplicate=True),
      Output("summary-output-content", "children", allow_duplicate=True),
@@ -1551,7 +1735,8 @@ def show_error_message(n_clicks, core_table_vars, maternal_tree_vars, garden_cli
 def populate_stats_options(row_data):
     # This runs when grid row data is first loaded/updated. Let's provide options based on numeric columns in row_data.
     if not row_data:
-        return {"display": "none"}, [], [], [], [], [], [], None, None, None, None, None, None, None, html.Div(), html.Div(), html.Div(), html.Div()
+        empty = html.Div()
+        return {"display": "none"}, [], [], [], [], [], [], [], [], None, None, None, None, None, None, None, None, None, "", empty, empty, empty, empty, empty
     
     df = pd.DataFrame(row_data)
     numeric_cols = []
@@ -1560,27 +1745,125 @@ def populate_stats_options(row_data):
     for c in df.columns:
         if c == '__select__':
             continue
-        all_options.append({"label": c, "value": c})
         col_series = df[c]
+        all_options.append(_analysis_option(c, col_series))
         try:
-            if is_numeric_dtype(col_series):
+            if _is_numeric_like(col_series):
                 numeric_cols.append(c)
-            else:
-                sample = pd.to_numeric(col_series.dropna().head(TYPE_DETECTION_SAMPLE_SIZE), errors='coerce')
-                if len(sample) > 0 and sample.notna().sum() / float(len(sample)) >= NUMERIC_THRESHOLD:
-                    numeric_cols.append(c)
         except Exception:
             pass
             
-    options = [{"label": col, "value": col} for col in numeric_cols]
+    numeric_options = [_analysis_option(col, df[col]) for col in numeric_cols]
     
     # We also clear out previous results and selections to easily support new joins
     return (
         {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0", "marginTop": "20px"},
-        options, options, options, options, all_options, all_options,
-        None, None, None, None, None, None, None,
+        numeric_options, numeric_options, numeric_options, numeric_options, all_options, all_options,
+        numeric_options, numeric_options,
+        None, None, None, None, None, None, None, None, None, "", html.Div(),
         html.Div(), html.Div(), html.Div(), html.Div()
     )
+
+
+@callback(
+    Output("calculated-column-right-wrapper", "style"),
+    [Input("calculated-column-operation", "value")],
+    prevent_initial_call=False
+)
+def toggle_calculated_column_second_variable(operation):
+    if operation == "center":
+        return {"display": "none"}
+    return {"display": "block", "flex": "1 1 0", "minWidth": "180px"}
+
+
+@callback(
+    [Output("join-tab-grid", "rowData"),
+     Output("join-tab-grid", "columnDefs"),
+     Output("calculated-columns-store", "data", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "options", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "value", allow_duplicate=True),
+     Output("calculated-column-status", "children", allow_duplicate=True)],
+    [Input("add-calculated-column-button", "n_clicks")],
+    [State("join-tab-grid", "rowData"),
+     State("join-tab-grid", "columnDefs"),
+     State("calculated-column-name", "value"),
+     State("calculated-column-operation", "value"),
+     State("calculated-column-left", "value"),
+     State("calculated-column-right", "value"),
+     State("calculated-columns-store", "data")],
+    prevent_initial_call=True
+)
+def add_calculated_column(n_clicks, row_data, column_defs, new_name, operation, left_col, right_col, calculated_columns):
+    if not n_clicks:
+        raise PreventUpdate
+    if not row_data:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div("Run a dataset preview before adding a calculated column.", className="status-warning")
+
+    clean_name = _safe_calculated_column_name(new_name)
+    if not clean_name:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div("Enter a valid calculated column name.", className="status-warning")
+
+    df = pd.DataFrame(row_data)
+    if clean_name in df.columns:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div("Choose a column name that is not already in the table.", className="status-warning")
+
+    try:
+        df[clean_name] = _calculated_column_series(df, operation, left_col, right_col)
+    except ValueError as exc:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div(str(exc), className="status-warning")
+    except Exception:
+        logger.exception("Unable to add calculated column")
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div("The calculated column could not be created from those variables.", className="status-warning")
+
+    updated_defs = list(column_defs or [])
+    updated_defs.append({
+        "headerName": clean_name,
+        "field": clean_name,
+        "filter": "agNumberColumnFilter",
+        "filterParams": {
+            "filterOptions": ["equals", "notEqual", "lessThan", "lessThanOrEqual", "greaterThan", "greaterThanOrEqual"],
+            "suppressAndOrCondition": True,
+        },
+    })
+
+    updated_calculated_columns = list(calculated_columns or []) + [clean_name]
+    remove_options = _calculated_column_options(updated_calculated_columns)
+
+    return df.to_dict("records"), updated_defs, updated_calculated_columns, remove_options, None, html.Div(f"Added calculated column: {clean_name}", style={"color": "#155724"})
+
+
+@callback(
+    [Output("join-tab-grid", "rowData", allow_duplicate=True),
+     Output("join-tab-grid", "columnDefs", allow_duplicate=True),
+     Output("calculated-columns-store", "data", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "options", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "value", allow_duplicate=True),
+     Output("calculated-column-status", "children", allow_duplicate=True)],
+    [Input("remove-calculated-column-button", "n_clicks")],
+    [State("join-tab-grid", "rowData"),
+     State("join-tab-grid", "columnDefs"),
+     State("remove-calculated-column-dropdown", "value"),
+     State("calculated-columns-store", "data")],
+    prevent_initial_call=True
+)
+def remove_calculated_column(n_clicks, row_data, column_defs, column_name, calculated_columns):
+    if not n_clicks:
+        raise PreventUpdate
+    if not column_name:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div("Choose a calculated column to remove.", className="status-warning")
+    if column_name not in (calculated_columns or []):
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, None, html.Div("That column is not tracked as a calculated column.", className="status-warning")
+
+    df = pd.DataFrame(row_data or [])
+    if column_name in df.columns:
+        df = df.drop(columns=[column_name])
+
+    updated_defs = _remove_column_def(column_defs, column_name)
+    updated_calculated_columns = [name for name in (calculated_columns or []) if name != column_name]
+    remove_options = _calculated_column_options(updated_calculated_columns)
+
+    return df.to_dict("records"), updated_defs, updated_calculated_columns, remove_options, None, html.Div(f"Removed calculated column: {column_name}", style={"color": "#155724"})
+
 
 @callback(
     [Output("test-container", "style", allow_duplicate=True),
@@ -1607,6 +1890,7 @@ def show_test_container(selected_test):
     
     return {"display": "block"}, lr_style, pca_style, summary_style, plot_data_style, empty_output, empty_output, empty_output, empty_output
 
+
 @callback(
     Output("pca-warning", "children", allow_duplicate=True),
     [Input("pca-variables", "value")],
@@ -1623,20 +1907,32 @@ def get_analysis_df(base_query, filter_model):
         df = apply_filter_model(df, filter_model)
     return df
 
+
+def get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, required_columns=None):
+    required_columns = set(required_columns or [])
+    if row_data:
+        df = pd.DataFrame(row_data)
+        if not required_columns or required_columns.issubset(set(df.columns)):
+            if filter_model:
+                df = apply_filter_model(df, filter_model)
+            return df
+    return get_analysis_df(base_query, filter_model)
+
 @callback(
     Output("lr-output-content", "children", allow_duplicate=True),
     [Input("run-lr-button", "n_clicks")],
     [State("join-tab-full-query", "data"),
+     State("join-tab-grid", "rowData"),
      State("join-tab-grid", "filterModel"),
      State("lr-x-variable", "value"),
      State("lr-y-variable", "value")],
     prevent_initial_call=True
 )
-def run_linear_regression(n_clicks, base_query, filter_model, x_var, y_var):
+def run_linear_regression(n_clicks, base_query, row_data, filter_model, x_var, y_var):
     if not base_query or not x_var or not y_var:
         raise PreventUpdate
         
-    df = get_analysis_df(base_query, filter_model)
+    df = get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, [x_var, y_var])
     df = df.dropna(subset=[x_var, y_var])
     
     # Needs numeric conversion just in case
@@ -1697,16 +1993,17 @@ def run_linear_regression(n_clicks, base_query, filter_model, x_var, y_var):
     Output("pca-output-content", "children", allow_duplicate=True),
     [Input("run-pca-button", "n_clicks")],
     [State("join-tab-full-query", "data"),
+     State("join-tab-grid", "rowData"),
      State("join-tab-grid", "filterModel"),
      State("pca-variables", "value"),
      State("pca-dimensions", "value")], 
     prevent_initial_call=True
 )
-def run_pca(n_clicks, base_query, filter_model, variables, dimensions):
+def run_pca(n_clicks, base_query, row_data, filter_model, variables, dimensions):
     if not base_query or not variables:
         raise PreventUpdate
         
-    df = get_analysis_df(base_query, filter_model)
+    df = get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, variables)
     df = df.dropna(subset=variables)
     
     for v in variables:
@@ -1774,15 +2071,16 @@ def run_pca(n_clicks, base_query, filter_model, variables, dimensions):
     Output("summary-output-content", "children", allow_duplicate=True),
     [Input("run-summary-button", "n_clicks")],
     [State("join-tab-full-query", "data"),
+     State("join-tab-grid", "rowData"),
      State("join-tab-grid", "filterModel"),
      State("summary-variable", "value")],
     prevent_initial_call=True
 )
-def run_summary(n_clicks, base_query, filter_model, variable):
+def run_summary(n_clicks, base_query, row_data, filter_model, variable):
     if not base_query or not variable:
         raise PreventUpdate
         
-    df = get_analysis_df(base_query, filter_model)
+    df = get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, [variable])
     
     df[variable] = pd.to_numeric(df[variable], errors='coerce')
     clean_data = df[variable].dropna()
@@ -1874,7 +2172,7 @@ def run_plot_data(n_clicks, graph_type, base_query, row_data, selected_rows, fil
             html.H5("Insufficient Data", style={"color": "red"}),
             html.P("No valid data points for plotting.")
         ], style={"color": "red", "fontWeight": "bold"}), {"display": "none"}
-        
+
     df = df.dropna(subset=[x_var, y_var])
     
     if len(df) == 0:
