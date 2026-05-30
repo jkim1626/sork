@@ -481,6 +481,10 @@ joins_layout = dcc.Tab(
                                             html.Label("Y-axis:", style={"marginRight": "10px"}),
                                             dcc.Dropdown(id="lr-y-variable", placeholder="Select y Variable"),
                                         ], style={"marginBottom": "10px"}),
+                                        html.Div([
+                                            html.Label("Color by (optional):", style={"marginRight": "10px"}),
+                                            dcc.Dropdown(id="lr-color-variable", placeholder="Select color variable"),
+                                        ], style={"marginBottom": "10px"}),
                                         html.Button("Generate Regression", id="run-lr-button", n_clicks=0,
                                                    style={
                                                        "backgroundColor": "#007bff",
@@ -515,6 +519,10 @@ joins_layout = dcc.Tab(
                                                 style={"marginBottom": "10px"}
                                             ),
                                         ]),
+                                        html.Div([
+                                            html.Label("Color by (optional):", style={"marginRight": "10px"}),
+                                            dcc.Dropdown(id="pca-color-variable", placeholder="Select color variable"),
+                                        ], style={"marginBottom": "10px"}),
                                         html.Button("Generate PCA", id="run-pca-button", n_clicks=0,
                                                    style={
                                                        "backgroundColor": "#007bff",
@@ -808,6 +816,8 @@ def set_tab_active(tab_value):
      Output('pca-output-content', 'children', allow_duplicate=True),
      Output('summary-output-content', 'children', allow_duplicate=True),
      Output('pd-output-content', 'children', allow_duplicate=True),
+     Output('lr-color-variable', 'value', allow_duplicate=True),
+     Output('pca-color-variable', 'value', allow_duplicate=True),
      Output('join-right-placeholder', 'style', allow_duplicate=True)],
     [Input('joins-tab-active', 'data')],
     prevent_initial_call=True
@@ -1372,6 +1382,8 @@ FROM (
      Output("calculated-columns-store", "data", allow_duplicate=True),
      Output("remove-calculated-column-dropdown", "options", allow_duplicate=True),
      Output("remove-calculated-column-dropdown", "value", allow_duplicate=True),
+     Output("lr-color-variable", "value", allow_duplicate=True),
+     Output("pca-color-variable", "value", allow_duplicate=True),
      Output("join-right-placeholder", "style", allow_duplicate=True)],
     [Input("join-core-table-options", "value"),
      Input("join-tree-table-options", "value"),
@@ -1401,6 +1413,8 @@ def reset_results_on_selection_change(core_vars, tree_vars, year_filter, site_fi
         empty,
         [],
         [],
+        None,
+        None,
         None,
         {"display": "block", "height": "100%"},
     )
@@ -1568,6 +1582,8 @@ def show_error_message(n_clicks, core_table_vars, maternal_tree_vars):
      Output("pd-color-variable", "options"),
      Output("calculated-column-left", "options"),
      Output("calculated-column-right", "options"),
+     Output("lr-color-variable", "options"),
+     Output("pca-color-variable", "options"),
      Output("stats-test-dropdown", "value"),
      Output("lr-x-variable", "value"),
      Output("lr-y-variable", "value"),
@@ -1578,6 +1594,8 @@ def show_error_message(n_clicks, core_table_vars, maternal_tree_vars):
      Output("pd-color-variable", "value"),
      Output("calculated-column-left", "value"),
      Output("calculated-column-right", "value"),
+     Output("lr-color-variable", "value"),
+     Output("pca-color-variable", "value"),
      Output("calculated-column-name", "value"),
      Output("calculated-column-status", "children", allow_duplicate=True),
      Output("lr-output-content", "children", allow_duplicate=True),
@@ -1591,7 +1609,7 @@ def populate_stats_options(row_data):
     # This runs when grid row data is first loaded/updated. Let's provide options based on numeric columns in row_data.
     if not row_data:
         empty = html.Div()
-        return {"display": "none"}, [], [], [], [], [], [], [], [], [], None, None, None, None, None, None, None, None, None, None, "", empty, empty, empty, empty, empty
+        return {"display": "none"}, [], [], [], [], [], [], [], [], [], [], [], None, None, None, None, None, None, None, None, None, None, None, None, "", empty, empty, empty, empty, empty
     
     df = pd.DataFrame(row_data)
     numeric_cols = []
@@ -1616,7 +1634,8 @@ def populate_stats_options(row_data):
         numeric_options, numeric_options, numeric_options, numeric_options, all_options, all_options,
         all_options,
         numeric_options, numeric_options,
-        None, None, None, None, None, None, None, None, None, None, "", html.Div(),
+        all_options, all_options,
+        None, None, None, None, None, None, None, None, None, None, None, None, "", html.Div(),
         html.Div(), html.Div(), html.Div(), html.Div()
     )
 
@@ -1781,14 +1800,18 @@ def get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, requi
      State("join-tab-grid", "rowData"),
      State("join-tab-grid", "filterModel"),
      State("lr-x-variable", "value"),
-     State("lr-y-variable", "value")],
+     State("lr-y-variable", "value"),
+     State("lr-color-variable", "value")],
     prevent_initial_call=True
 )
-def run_linear_regression(n_clicks, base_query, row_data, filter_model, x_var, y_var):
+def run_linear_regression(n_clicks, base_query, row_data, filter_model, x_var, y_var, color_var):
     if not base_query or not x_var or not y_var:
         raise PreventUpdate
         
-    df = get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, [x_var, y_var])
+    cols_to_use = [x_var, y_var]
+    if color_var:
+        cols_to_use.append(color_var)
+    df = get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, cols_to_use)
     df = df.dropna(subset=[x_var, y_var])
     
     # Needs numeric conversion just in case
@@ -1796,6 +1819,9 @@ def run_linear_regression(n_clicks, base_query, row_data, filter_model, x_var, y
     df[y_var] = pd.to_numeric(df[y_var], errors='coerce')
     df = df.dropna(subset=[x_var, y_var])
     
+    if color_var and color_var in df.columns:
+        df = df.dropna(subset=[color_var])
+        
     if df is None or df.empty or len(df) < MIN_ROWS_FOR_REGRESSION:
         return html.Div([
             html.H5("Insufficient Data", style={"color": "red"}),
@@ -1809,8 +1835,18 @@ def run_linear_regression(n_clicks, base_query, row_data, filter_model, x_var, y
     x_range = np.linspace(min(x), max(x), 100)
     y_pred = slope * x_range + intercept
     
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x, y=y, mode='markers', name='Data Points', marker=dict(color='blue', opacity=0.6, size=8)))
+    if color_var and color_var in df.columns:
+        # Check if color variable is numeric or categorical
+        try:
+            df[color_var] = pd.to_numeric(df[color_var])
+        except Exception:
+            pass
+        fig = px.scatter(df, x=x_var, y=y_var, color=color_var, opacity=0.6)
+        fig.update_traces(marker=dict(size=8))
+    else:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=x, y=y, mode='markers', name='Data Points', marker=dict(color='blue', opacity=0.6, size=8)))
+        
     fig.add_trace(go.Scatter(x=x_range, y=y_pred, mode='lines', name='Regression Line', line=dict(color='red', width=2)))
     
     r_squared = r_value**2
@@ -1854,20 +1890,28 @@ def run_linear_regression(n_clicks, base_query, row_data, filter_model, x_var, y
      State("join-tab-grid", "rowData"),
      State("join-tab-grid", "filterModel"),
      State("pca-variables", "value"),
-     State("pca-dimensions", "value")], 
+     State("pca-dimensions", "value"),
+     State("pca-color-variable", "value")], 
     prevent_initial_call=True
 )
-def run_pca(n_clicks, base_query, row_data, filter_model, variables, dimensions):
+def run_pca(n_clicks, base_query, row_data, filter_model, variables, dimensions, color_var):
     if not base_query or not variables:
         raise PreventUpdate
         
-    df = get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, variables)
+    cols_to_use = list(variables)
+    if color_var:
+        cols_to_use.append(color_var)
+        
+    df = get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, cols_to_use)
     df = df.dropna(subset=variables)
     
     for v in variables:
         df[v] = pd.to_numeric(df[v], errors='coerce')
         
     df = df.dropna(subset=variables)
+    
+    if color_var and color_var in df.columns:
+        df = df.dropna(subset=[color_var])
     
     if df is None or df.empty or len(df) < MIN_ROWS_FOR_PCA:
         return html.Div([
@@ -1885,11 +1929,21 @@ def run_pca(n_clicks, base_query, row_data, filter_model, variables, dimensions)
     pca_df = pd.DataFrame(data=pca_result, columns=[f'PC{i+1}' for i in range(n_components)])
     explained_variance = pca.explained_variance_ratio_ * 100
     
+    if color_var and color_var in df.columns:
+        # Check if color variable is numeric or categorical
+        try:
+            df[color_var] = pd.to_numeric(df[color_var])
+        except Exception:
+            pass
+        pca_df[color_var] = df[color_var].values
+        
     if dimensions == '3d' and n_components >= 3:
         fig = px.scatter_3d(pca_df, x='PC1', y='PC2', z='PC3', title="3D PCA Visualization",
+            color=color_var if (color_var and color_var in pca_df.columns) else None,
             labels={'PC1': f'PC1 ({explained_variance[0]:.2f}%)', 'PC2': f'PC2 ({explained_variance[1]:.2f}%)', 'PC3': f'PC3 ({explained_variance[2]:.2f}%)'}, opacity=0.7)
     else:
         fig = px.scatter(pca_df, x='PC1', y='PC2', title="2D PCA Visualization",
+            color=color_var if (color_var and color_var in pca_df.columns) else None,
             labels={'PC1': f'PC1 ({explained_variance[0]:.2f}%)', 'PC2': f'PC2 ({explained_variance[1]:.2f}%)'}, opacity=0.7)
             
     fig.update_layout(height=600, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
