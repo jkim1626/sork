@@ -23,7 +23,26 @@ TABLE_DESCRIPTIONS = {
     "dat_climdb": "Climate Database",
     "dat_cgp_db": "Common Garden Phenotypes",
     "dat_avail_db": "Data Availability Metadata",
+    "common_garden_yearly_census": "Common Garden Yearly Census",
+    "common_garden_generic": "Common Garden Generic",
+    "adult_tree_generic": "Adult Tree Generic",
+    "qplad_template_census_meta": "Common Garden Yearly Census",
+    "qplad_template_commongarden_generic": "Common Garden Generic",
+    "qplad_template_adult_generic": "Adult Tree Generic",
 }
+
+UPLOAD_TEMPLATE_TARGETS = {
+    "common_garden_yearly_census": {
+        "meta_table": "qplad_template_census_meta",
+    },
+    "common_garden_generic": {
+        "meta_table": "qplad_template_commongarden_generic_meta",
+    },
+    "adult_tree_generic": {
+        "meta_table": "qplad_template_adult_generic_meta",
+    },
+}
+UPLOAD_TEMPLATE_TABLES = list(UPLOAD_TEMPLATE_TARGETS)
 
 
 class DatabaseAccessError(Exception):
@@ -110,16 +129,32 @@ def get_allowed_tables():
     return [table.strip() for table in table_options.split(",") if table.strip()]
 
 
+def get_upload_template_tables():
+    env_value = os.getenv("UPLOAD_TEMPLATE_TABLES", "")
+    configured = [table.strip() for table in env_value.split(",") if table.strip()]
+    return configured or UPLOAD_TEMPLATE_TABLES
+
+
+def _get_upload_template_meta_table(table_name):
+    target = UPLOAD_TEMPLATE_TARGETS.get(table_name)
+    return target.get("meta_table") if target else None
+
+
 def _quote_identifier(identifier):
     if not identifier or not _IDENTIFIER_PATTERN.fullmatch(identifier):
         raise DatabaseAccessError(f"Unsafe SQL identifier: {identifier!r}")
     return f"[{identifier}]"
 
 
-def _validate_table_name(table_name):
-    if table_name not in get_allowed_tables():
+def _validate_table_name(table_name, allowed_tables=None):
+    allowed = get_allowed_tables() if allowed_tables is None else allowed_tables
+    if table_name not in allowed:
         raise DatabaseAccessError(f"Table '{table_name}' is not available in this app.")
     return table_name
+
+
+def _validate_upload_template_table(table_name):
+    return _validate_table_name(table_name, allowed_tables=get_upload_template_tables())
 
 
 def fetch_query_dataframe(query, connection_type="read"):
@@ -148,6 +183,18 @@ def fetch_query_dataframe_public(query):
 
 def get_table_columns(table_name):
     validated_table = _validate_table_name(table_name)
+    return _get_columns_for_validated_table(validated_table)
+
+
+def get_upload_template_columns(table_name):
+    validated_table = _validate_upload_template_table(table_name)
+    meta_schema = _get_upload_template_schema_from_meta(validated_table)
+    if meta_schema is not None:
+        return meta_schema["COLUMN_NAME"].tolist()
+    return _get_columns_for_validated_table(validated_table)
+
+
+def _get_columns_for_validated_table(validated_table):
     query = text("""
     SELECT COLUMN_NAME
     FROM INFORMATION_SCHEMA.COLUMNS
@@ -162,7 +209,7 @@ def get_table_columns(table_name):
     except Exception as exc:
         logger.warning("Unable to load INFORMATION_SCHEMA columns for %s; falling back to source columns.", validated_table)
         try:
-            preview_df = get_table_preview(validated_table, limit=1)
+            preview_df = _get_table_preview_for_validated_table(validated_table, limit=1)
             return preview_df.columns.tolist()
         except Exception as fallback_exc:
             raise DatabaseAccessError(f"Unable to load columns for '{validated_table}': {fallback_exc}") from fallback_exc
@@ -172,7 +219,7 @@ def get_table_columns(table_name):
 
     if df.empty:
         try:
-            preview_df = get_table_preview(validated_table, limit=1)
+            preview_df = _get_table_preview_for_validated_table(validated_table, limit=1)
             return preview_df.columns.tolist()
         except Exception as fallback_exc:
             raise DatabaseAccessError(f"Table '{validated_table}' does not expose any columns.") from fallback_exc
@@ -182,6 +229,49 @@ def get_table_columns(table_name):
 
 def get_table_schema_preview(table_name):
     validated_table = _validate_table_name(table_name)
+    return _get_schema_preview_for_validated_table(validated_table)
+
+
+def get_upload_template_schema_preview(table_name):
+    validated_table = _validate_upload_template_table(table_name)
+    meta_schema = _get_upload_template_schema_from_meta(validated_table)
+    if meta_schema is not None:
+        return meta_schema
+    return _get_schema_preview_for_validated_table(validated_table)
+
+
+def _get_upload_template_schema_from_meta(validated_table):
+    meta_table = _get_upload_template_meta_table(validated_table)
+    if not meta_table:
+        return None
+    query = f"""
+    SELECT
+        [Variable],
+        [Type],
+        [Required],
+        [Description]
+    FROM [dbo].{_quote_identifier(meta_table)}
+    """
+    meta_df = fetch_query_dataframe(query)
+    if meta_df.empty:
+        raise DatabaseAccessError(f"Template metadata table '{meta_table}' has no rows.")
+    return pd.DataFrame(
+        {
+            "ORDINAL_POSITION": range(1, len(meta_df) + 1),
+            "COLUMN_NAME": meta_df["Variable"].astype(str),
+            "DATA_TYPE": meta_df["Type"].fillna("unavailable").astype(str),
+            "IS_NULLABLE": meta_df["Required"].map(lambda value: "NO" if str(value).strip().lower() == "always" else "YES"),
+            "CHARACTER_MAXIMUM_LENGTH": None,
+            "NUMERIC_PRECISION": None,
+            "NUMERIC_SCALE": None,
+            "REQUIRED_RULE": meta_df["Required"].fillna("").astype(str),
+            "COLUMN_DESCRIPTION": meta_df["Description"].fillna("").astype(str),
+            "SCHEMA_SOURCE": meta_table,
+        }
+    )
+
+
+def _get_schema_preview_for_validated_table(validated_table):
     query = """
     SELECT
         ORDINAL_POSITION,
@@ -212,7 +302,7 @@ def get_table_schema_preview(table_name):
         return df
 
     try:
-        preview_df = get_table_preview(validated_table, limit=1)
+        preview_df = _get_table_preview_for_validated_table(validated_table, limit=1)
     except Exception as exc:
         raise DatabaseAccessError(f"Unable to load schema for '{validated_table}': {exc}") from exc
 
@@ -238,6 +328,10 @@ def get_table_schema_preview(table_name):
 
 def get_table_preview(table_name, limit=1):
     validated_table = _validate_table_name(table_name)
+    return _get_table_preview_for_validated_table(validated_table, limit=limit)
+
+
+def _get_table_preview_for_validated_table(validated_table, limit=1):
     safe_limit = max(1, int(limit))
     query = f"SELECT TOP {safe_limit} * FROM [dbo].{_quote_identifier(validated_table)}"
     return fetch_query_dataframe(query)
@@ -268,8 +362,11 @@ def get_column_distinct_values(table_name, column, limit=200):
     return df["value"].tolist() if not df.empty else []
 
 
-def get_holding_table_name(source_table):
-    validated_table = _validate_table_name(source_table)
+def get_holding_table_name(source_table, upload_template=False):
+    if upload_template:
+        validated_table = _validate_upload_template_table(source_table)
+    else:
+        validated_table = _validate_table_name(source_table)
     clean = re.sub(r"[^A-Za-z0-9_]+", "_", validated_table).strip("_").lower()
     return f"upload_holding_{clean}"
 
@@ -315,8 +412,8 @@ def fetch_table_rows(table_name, columns, start_row=1, row_count=100, max_rows=N
 
 
 def validate_upload_dataframe(table_name, df):
-    validated_table = _validate_table_name(table_name)
-    expected_columns = get_table_columns(validated_table)
+    validated_table = _validate_upload_template_table(table_name)
+    expected_columns = get_upload_template_columns(validated_table)
 
     if df.empty:
         raise DatabaseAccessError("The uploaded workbook contains no data rows.")
@@ -362,8 +459,8 @@ def append_dataframe_to_holding_table(table_name, df, filename=None):
     reviewed before any promotion step.
     """
     upload_df, _expected_columns = validate_upload_dataframe(table_name, df)
-    validated_table = _validate_table_name(table_name)
-    holding_table = get_holding_table_name(validated_table)
+    validated_table = _validate_upload_template_table(table_name)
+    holding_table = get_holding_table_name(validated_table, upload_template=True)
     batch_id = str(uuid.uuid4())
     uploaded_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 

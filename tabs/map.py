@@ -53,10 +53,6 @@ UCLA_COORDINATES = {
 COMMON_GARDEN_SITES = {
     "Chico": {"latitude": 39.73, "longitude": -121.84},
     "Placerville": {"latitude": 38.73, "longitude": -120.80},
-    "Hopland": {"latitude": 39.00, "longitude": -123.07},
-    "McLaughlin": {"latitude": 38.87, "longitude": -122.43},
-    "Sierra Foothill": {"latitude": 39.24, "longitude": -121.29},
-    "Riverside": {"latitude": 33.97, "longitude": -117.33},
 }
 COMMON_GARDEN_SITE_ALIASES = {
     "IFG": "Placerville",
@@ -148,25 +144,128 @@ def _known_garden_coordinates(site_value):
     return None
 
 
-def _build_where_clause(table_name, selected_locations=None, selected_years=None, data_filter_col=None, data_filter_val=None):
+def _is_known_garden_site(value):
+    canonical_value = COMMON_GARDEN_SITE_ALIASES.get(str(value or "").strip(), value)
+    site_key = _normalized_site_key(canonical_value)
+    if not site_key:
+        return False
+    return any(site_key == _normalized_site_key(name) for name in COMMON_GARDEN_SITES)
+
+
+def _column_lookup(table_name):
+    return {column.lower(): column for column in get_table_columns(table_name)}
+
+
+def _resolve_column_name(table_name, column_name):
+    if not table_name or not column_name:
+        return None
+    return _column_lookup(table_name).get(str(column_name).lower())
+
+
+def _sql_like_literal(value):
+    text = str(value).replace("'", "''").replace("[", "[[]").replace("%", "[%]").replace("_", "[_]")
+    return f"'%{text}%'"
+
+
+def _ag_simple_filter_clause(column, filter_def):
+    filter_type = filter_def.get("filterType")
+    filter_value = filter_def.get("filter")
+    filter_to = filter_def.get("filterTo")
+    operator_type = filter_def.get("type") or "contains"
+
+    if filter_type == "set":
+        values = [value for value in (filter_def.get("values") or []) if value not in (None, "")]
+        if not values:
+            return None
+        return f"[{column}] IN ({', '.join(_sql_literal(value) for value in values)})"
+
+    if operator_type == "blank":
+        return f"[{column}] IS NULL"
+    if operator_type == "notBlank":
+        return f"[{column}] IS NOT NULL"
+    if filter_value in (None, ""):
+        return None
+
+    if filter_type in {"number", "date"}:
+        comparators = {
+            "equals": "=",
+            "notEqual": "<>",
+            "lessThan": "<",
+            "lessThanOrEqual": "<=",
+            "greaterThan": ">",
+            "greaterThanOrEqual": ">=",
+        }
+        if operator_type == "inRange" and filter_to not in (None, ""):
+            return f"[{column}] BETWEEN {_sql_literal(filter_value)} AND {_sql_literal(filter_to)}"
+        comparator = comparators.get(operator_type)
+        if comparator:
+            return f"[{column}] {comparator} {_sql_literal(filter_value)}"
+        return None
+
+    if operator_type == "equals":
+        return f"CAST([{column}] AS VARCHAR(MAX)) = {_sql_literal(filter_value)}"
+    if operator_type == "notEqual":
+        return f"CAST([{column}] AS VARCHAR(MAX)) <> {_sql_literal(filter_value)}"
+    if operator_type == "startsWith":
+        return f"CAST([{column}] AS VARCHAR(MAX)) LIKE {_sql_literal(str(filter_value) + '%')}"
+    if operator_type == "endsWith":
+        return f"CAST([{column}] AS VARCHAR(MAX)) LIKE {_sql_literal('%' + str(filter_value))}"
+    if operator_type == "notContains":
+        return f"CAST([{column}] AS VARCHAR(MAX)) NOT LIKE {_sql_like_literal(filter_value)}"
+    return f"CAST([{column}] AS VARCHAR(MAX)) LIKE {_sql_like_literal(filter_value)}"
+
+
+def _ag_filter_clauses(table_name, filter_model):
+    if not table_name or not filter_model:
+        return []
+    clauses = []
+    for grid_column, filter_def in (filter_model or {}).items():
+        column = _resolve_column_name(table_name, grid_column)
+        if not column or not isinstance(filter_def, dict):
+            continue
+        conditions = filter_def.get("conditions")
+        if conditions:
+            condition_clauses = [
+                _ag_simple_filter_clause(column, condition)
+                for condition in conditions
+                if isinstance(condition, dict)
+            ]
+            condition_clauses = [clause for clause in condition_clauses if clause]
+            if condition_clauses:
+                joiner = " OR " if filter_def.get("operator") == "OR" else " AND "
+                clauses.append("(" + joiner.join(condition_clauses) + ")")
+            continue
+        clause = _ag_simple_filter_clause(column, filter_def)
+        if clause:
+            clauses.append(clause)
+    return clauses
+
+
+def _build_where_clause(table_name, selected_locations=None, selected_years=None, data_filter_col=None, data_filter_val=None, filter_model=None):
     clauses = ["[Latitude] IS NOT NULL", "[Longitude] IS NOT NULL"]
     if selected_locations:
         values = ", ".join(_sql_literal(value) for value in selected_locations)
-        clauses.append(f"[locality_full_name] IN ({values})")
+        locality_col = _resolve_column_name(table_name, "locality_full_name") or _resolve_column_name(table_name, "Locality_full_name")
+        if locality_col:
+            clauses.append(f"[{locality_col}] IN ({values})")
     if selected_years and _table_has_column(table_name, "Year"):
         values = ", ".join(_sql_literal(value) for value in selected_years)
         clauses.append(f"[Year] IN ({values})")
     if data_filter_col and data_filter_val is not None and data_filter_val != "" and _table_has_column(table_name, data_filter_col):
         clauses.append(f"[{data_filter_col}] = {_sql_literal(data_filter_val)}")
+    clauses.extend(_ag_filter_clauses(table_name, filter_model))
     return " AND ".join(clauses)
 
 
-def _build_site_aggregate_query(selected_source, selected_locations=None, selected_years=None, data_filter_col=None, data_filter_val=None):
+def _build_site_aggregate_query(selected_source, selected_locations=None, selected_years=None, data_filter_col=None, data_filter_val=None, filter_model=None):
     table_name = _map_table_name(selected_source)
     if not table_name:
         return None
+    locality_col = _resolve_column_name(table_name, "locality_full_name") or _resolve_column_name(table_name, "Locality_full_name")
+    if not locality_col:
+        return None
     
-    where_clause = _build_where_clause(table_name, selected_locations, selected_years, data_filter_col, data_filter_val)
+    where_clause = _build_where_clause(table_name, selected_locations, selected_years, data_filter_col, data_filter_val, filter_model)
     
     # If the table is dat_avail_db and a year filter is applied, we must check db_main
     if table_name == "dat_avail_db" and selected_years and not _table_has_column(table_name, "Year"):
@@ -176,21 +275,24 @@ def _build_site_aggregate_query(selected_source, selected_locations=None, select
 
     return f"""
 SELECT
-    [locality_full_name],
+    [{locality_col}] AS [locality_full_name],
     AVG([Longitude]) AS avg_longitude,
     AVG([Latitude]) AS avg_latitude,
     COUNT(*) AS tree_count
 FROM [dbo].[{table_name}]
 WHERE {where_clause}
-GROUP BY [locality_full_name]
+GROUP BY [{locality_col}]
 """
 
 
-def _build_coordinate_query(selected_source, selected_locations=None, selected_years=None, data_filter_col=None, data_filter_val=None):
+def _build_coordinate_query(selected_source, selected_locations=None, selected_years=None, data_filter_col=None, data_filter_val=None, filter_model=None):
     table_name = _map_table_name(selected_source)
     if not table_name:
         return None
     available_columns = set(get_table_columns(table_name))
+    locality_col = _resolve_column_name(table_name, "locality_full_name") or _resolve_column_name(table_name, "Locality_full_name")
+    if not locality_col:
+        return None
     optional_selects = []
     for column_name in OPTIONAL_MAP_COLUMNS:
         if column_name in available_columns:
@@ -198,7 +300,7 @@ def _build_coordinate_query(selected_source, selected_locations=None, selected_y
         else:
             optional_selects.append(f"NULL AS [{column_name}]")
             
-    where_clause = _build_where_clause(table_name, selected_locations, selected_years, data_filter_col, data_filter_val)
+    where_clause = _build_where_clause(table_name, selected_locations, selected_years, data_filter_col, data_filter_val, filter_model)
     
     # If the table is dat_avail_db and a year filter is applied, we must check db_main
     if table_name == "dat_avail_db" and selected_years and not _table_has_column(table_name, "Year"):
@@ -209,7 +311,7 @@ def _build_coordinate_query(selected_source, selected_locations=None, selected_y
     return f"""
 SELECT
     {_sql_literal(table_name)} AS [source_table],
-    [locality_full_name],
+    [{locality_col}] AS [locality_full_name],
     [Latitude],
     [Longitude],
     {', '.join(optional_selects)}
@@ -274,21 +376,20 @@ def _build_detail_query(source_table, locality_name=None, latitude=None, longitu
 
 def _availability_panel(selected_source):
     table_name = _map_table_name(selected_source)
-    rows = []
-    if table_name:
-        count_df = _safe_fetch(f"SELECT COUNT(*) AS row_count FROM [dbo].[{table_name}]")
-        row_count = int(count_df.iloc[0]["row_count"]) if not count_df.empty else 0
-        rows.append({"Dataset": table_name, "Rows": f"{row_count:,}"})
-
-    note = "Uploaded tree datasets become visible here automatically when they are written into a mappable table."
-    if dat_avail_table:
-        note = f"Availability metadata sync is enabled via `{dat_avail_table}` when uploads succeed."
+    availability_table = _sanitize_identifier(dat_avail_table) if dat_avail_table else table_name
+    availability_df = pd.DataFrame()
+    note = "Use the table filters to choose the data shown on the map."
+    if availability_table:
+        availability_df = _safe_fetch(f"SELECT TOP 500 * FROM [dbo].[{availability_table}]")
+        note = f"Showing up to 500 rows from `{availability_table}`. Table filters update the map."
+    if availability_df.empty:
+        availability_df = pd.DataFrame([{"Dataset": table_name or "Tree site records", "Rows": "Unavailable"}])
 
     return html.Div(
         [
             html.H6("Dataset Availability", className="section-title"),
             html.P(note, className="section-copy"),
-            _make_grid(pd.DataFrame(rows), "map-availability-grid", height=155, page_size=5),
+            _make_grid(availability_df, "map-availability-grid", height=560, page_size=25),
         ],
         className="panel-card map-availability-card",
     )
@@ -343,21 +444,78 @@ def _make_table(df, table_id, page_size=10):
 
 
 def _make_grid(df, grid_id, height=320, page_size=10):
+    numeric_columns = set()
+
+    def _column_def(column):
+        column_values = df[column].dropna()
+        is_numeric = False
+        try:
+            if pd.api.types.is_numeric_dtype(column_values):
+                is_numeric = True
+            else:
+                sample = column_values.head(50)
+                coerced = pd.to_numeric(sample, errors="coerce")
+                if len(sample) > 0 and coerced.notna().sum() / float(len(sample)) >= 0.9:
+                    is_numeric = True
+        except Exception:
+            is_numeric = False
+
+        if is_numeric:
+            numeric_columns.add(column)
+
+        base_def = {
+            "headerName": str(column),
+            "field": str(column),
+            "sortable": True,
+            "resizable": True,
+            "minWidth": 150 if column == "Dataset" else 110,
+            "flex": 2 if column == "Dataset" else 1,
+        }
+
+        if is_numeric:
+            base_def["filter"] = "agNumberColumnFilter"
+            base_def["filterParams"] = {
+                "filterOptions": [
+                    "equals",
+                    "notEqual",
+                    "lessThan",
+                    "lessThanOrEqual",
+                    "greaterThan",
+                    "greaterThanOrEqual",
+                ],
+                "suppressAndOrCondition": True,
+            }
+        else:
+            base_def["filter"] = "agTextColumnFilter"
+            base_def["filterParams"] = {
+                "filterOptions": [
+                    "contains",
+                    "notContains",
+                    "equals",
+                    "notEqual",
+                    "startsWith",
+                    "endsWith",
+                ],
+                "suppressAndOrCondition": True,
+            }
+
+        return base_def
+
+    column_defs = [_column_def(column) for column in df.columns]
+
+    row_data = []
+    for record in df.to_dict("records"):
+        if numeric_columns:
+            record = {
+                key: (pd.to_numeric(value, errors="coerce") if key in numeric_columns else value)
+                for key, value in record.items()
+            }
+        row_data.append(record)
+
     return AgGrid(
         id=grid_id,
-        rowData=df.to_dict("records"),
-        columnDefs=[
-            {
-                "headerName": str(column),
-                "field": str(column),
-                "filter": True,
-                "sortable": True,
-                "resizable": True,
-                "minWidth": 150 if column == "Dataset" else 110,
-                "flex": 2 if column == "Dataset" else 1,
-            }
-            for column in df.columns
-        ],
+        rowData=row_data,
+        columnDefs=column_defs,
         defaultColDef={"filter": True, "sortable": True, "resizable": True, "wrapText": True, "autoHeight": True},
         dashGridOptions={
             "pagination": True,
@@ -553,6 +711,23 @@ def _tree_hover_text(row, source_label=None):
     return "<br>".join(lines)
 
 
+def _search_identifier_variants(values, id_type):
+    variants = []
+    seen = set()
+    for value in values:
+        text = str(value).strip()
+        candidates = [text]
+        if id_type == "Accession" and text.isdigit():
+            candidates.append(text.rstrip("0") or "0")
+            if len(text) == 3:
+                candidates.append(f"{text}0")
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                variants.append(candidate)
+    return variants
+
+
 def _viewport_from_relayout(relayout_data, current_view=None):
     if not relayout_data:
         return current_view or DEFAULT_MAP_VIEW
@@ -605,14 +780,12 @@ map_layout = dcc.Tab(
                         html.Div(
                             [
                                 html.H6("Map Controls", className="section-title"),
-                                html.Label("Dataset scope", className="control-label"),
                                 dcc.Dropdown(
                                     id="map-source-dropdown",
                                     options=_initial_map_source_options(),
                                     value=_default_map_source_value(),
                                     clearable=False,
-                                    persistence=True,
-                                    persistence_type="session",
+                                    style={"display": "none"},
                                 ),
                                 html.Label("Locations", className="control-label"),
                                 dcc.Dropdown(
@@ -624,47 +797,27 @@ map_layout = dcc.Tab(
                                     persistence=True,
                                     persistence_type="session",
                                 ),
-                                html.Label("Years", className="control-label"),
                                 dcc.Dropdown(
                                     id="map-year-filter",
                                     options=[],
                                     value=[],
                                     multi=True,
                                     placeholder="All years",
-                                    persistence=True,
-                                    persistence_type="session",
+                                    style={"display": "none"},
                                 ),
-                                # Data Availability Filter
-                                html.Div(
-                                    [
-                                        html.H6("Data Availability Filter", className="section-title", style={"marginTop": "10px"}),
-                                        html.P(
-                                            "Show only map points where a specific column equals a given value (e.g. planted_in_common_garden = 1).",
-                                            className="section-copy",
-                                            style={"fontSize": "0.85em"},
-                                        ),
-                                        html.Label("Filter column", className="control-label"),
-                                        dcc.Dropdown(
-                                            id="map-data-filter-col",
-                                            options=[],
-                                            value=None,
-                                            placeholder="No column filter",
-                                            clearable=True,
-                                            persistence=True,
-                                            persistence_type="session",
-                                        ),
-                                        html.Label("Must equal", className="control-label"),
-                                        dcc.Dropdown(
-                                            id="map-data-filter-val",
-                                            options=[],
-                                            value=None,
-                                            placeholder="Select a value",
-                                            clearable=True,
-                                            persistence=True,
-                                            persistence_type="session",
-                                        ),
-                                    ],
-                                    className="data-filter-panel",
+                                dcc.Dropdown(
+                                    id="map-data-filter-col",
+                                    options=[],
+                                    value=None,
+                                    clearable=True,
+                                    style={"display": "none"},
+                                ),
+                                dcc.Dropdown(
+                                    id="map-data-filter-val",
+                                    options=[],
+                                    value=None,
+                                    clearable=True,
+                                    style={"display": "none"},
                                 ),
                                 html.Div(
                                     f"Known garden sites are shown as teal reference markers. Green circles = data sites, gold = UCLA, red = individual trees (zoom {INDIVIDUAL_TREE_ZOOM_THRESHOLD}+), blue = uploaded, purple = search hits.",
@@ -720,11 +873,10 @@ map_layout = dcc.Tab(
                                 ),
                                 dcc.Textarea(
                                     id="search-ids-input",
-                                    placeholder="Paste IDs here, one per line or comma-separated.",
+                                    placeholder="Enter multiple IDs:\n1, 5, 10, 432\n\nOr one per line:\n1\n5\n10\n432",
                                     style={
                                         "width": "100%",
                                         "height": "90px",
-                                        "fontFamily": "monospace",
                                         "borderRadius": "10px",
                                         "padding": "10px",
                                         "border": "1px solid #c9d7c8",
@@ -738,6 +890,11 @@ map_layout = dcc.Tab(
                                         html.Button("Clear", id="clear-search-btn", n_clicks=0, className="btn btn-outline-secondary"),
                                     ],
                                     className="button-row",
+                                ),
+                                dcc.Loading(
+                                    id="search-loading",
+                                    type="default",
+                                    children=html.Div(id="search-status-indicator", style={"minHeight": "20px"}),
                                 ),
                             ],
                             className="panel-card map-tool-card",
@@ -757,20 +914,34 @@ map_layout = dcc.Tab(
                             ],
                             className="summary-grid",
                         ),
-                        dcc.Graph(
-                            id="california-map",
-                            className="map-graph",
-                            config={
-                                "scrollZoom": True,
-                                "displayModeBar": True,
-                                "modeBarButtonsToRemove": ["lasso2d"],
-                            },
+                        html.Div(
+                            [
+                                dcc.Graph(
+                                    id="california-map",
+                                    className="map-graph",
+                                    config={
+                                        "scrollZoom": True,
+                                        "displayModeBar": True,
+                                        "modeBarButtonsToRemove": ["lasso2d"],
+                                    },
+                                ),
+                                html.Div(
+                                    id="map-availability-panel",
+                                    className="map-availability-strip",
+                                    children=_make_grid(
+                                        pd.DataFrame(columns=["Dataset", "Rows"]),
+                                        "map-availability-grid",
+                                        height=560,
+                                        page_size=25,
+                                    ),
+                                ),
+                            ],
+                            className="map-and-availability",
                         ),
                         html.Div(
-                            "Warning: detailed tree rendering and large search exports may take a while on broad dataset scopes.",
+                            "Warning: detailed tree rendering and large search exports may take a while for broad location selections.",
                             className="warning-banner",
                         ),
-                        html.Div(id="map-availability-panel", className="map-availability-strip", children=html.Div("Loading dataset availability...", className="placeholder-card")),
                         html.Div(
                             [
                                 html.Div(
@@ -807,7 +978,11 @@ map_layout = dcc.Tab(
                                     ],
                                     className="panel-card selection-download-card",
                                 ),
-                                html.Div(id="search-results-data"),
+                                dcc.Loading(
+                                    id="search-results-loading",
+                                    type="default",
+                                    children=html.Div(id="search-results-data"),
+                                ),
                             ],
                             className="map-results-stack",
                         ),
@@ -896,10 +1071,11 @@ def hydrate_map_source_options(_dropdown_id):
         Input("california-map", "clickData"),
         Input("map-data-filter-col", "value"),
         Input("map-data-filter-val", "value"),
+        Input("map-availability-grid", "filterModel"),
     ],
     State("map-viewport-store", "data"),
 )
-def update_map_and_click_data(reset_clicks, selected_source, selected_locations, selected_years, upload_data, click_data, data_filter_col, data_filter_val, viewport):
+def update_map_and_click_data(reset_clicks, selected_source, selected_locations, selected_years, upload_data, click_data, data_filter_col, data_filter_val, availability_filter_model, viewport):
     trigger_id = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else None
 
     if trigger_id == "california-map":
@@ -907,7 +1083,7 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
 
     fig = go.Figure()
     active_view = DEFAULT_MAP_VIEW if trigger_id == "reset-map" else (viewport or DEFAULT_MAP_VIEW)
-    aggregate_query = _build_site_aggregate_query(selected_source, selected_locations, selected_years, data_filter_col, data_filter_val)
+    aggregate_query = _build_site_aggregate_query(selected_source, selected_locations, selected_years, data_filter_col, data_filter_val, availability_filter_model)
     try:
         locations_df = _safe_fetch(aggregate_query) if aggregate_query else pd.DataFrame()
     except Exception:
@@ -918,7 +1094,7 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
 
     coordinate_records = []
     coordinates_df = pd.DataFrame()
-    coordinate_query = _build_coordinate_query(selected_source, selected_locations, selected_years, data_filter_col, data_filter_val)
+    coordinate_query = _build_coordinate_query(selected_source, selected_locations, selected_years, data_filter_col, data_filter_val, availability_filter_model)
     if coordinate_query:
         try:
             coordinates_df = _safe_fetch(coordinate_query)
@@ -928,17 +1104,15 @@ def update_map_and_click_data(reset_clicks, selected_source, selected_locations,
             coordinates_df = pd.DataFrame()
 
     if not locations_df.empty:
-        counts = locations_df["tree_count"].tolist()
-        min_size, max_size = 14, 36
-        min_count, max_count = min(counts), max(counts)
-        if min_count == max_count:
-            sizes = [16] * len(counts)
-        else:
-            sizes = [
-                min_size + (count - min_count) / (max_count - min_count) * (max_size - min_size)
-                for count in counts
-            ]
+        def _site_marker_size(count):
+            try:
+                value = float(count)
+            except (TypeError, ValueError):
+                return 16
+            size = 12 + (value ** 0.5) * 3
+            return min(max(size, 12), 36)
 
+        sizes = [_site_marker_size(count) for count in locations_df["tree_count"].tolist()]
         fig.add_trace(
             go.Scattermapbox(
                 mode="markers",
@@ -1136,7 +1310,8 @@ def update_location_filter_options(selected_source, upload_data, current_values)
     common_garden_df = _fetch_common_garden_tree_coordinates()
     if not common_garden_df.empty and "locality_full_name" in common_garden_df.columns:
         for value in common_garden_df["locality_full_name"].dropna().unique().tolist():
-            options_by_value[str(value)] = {"label": f"{value} (common garden)", "value": value}
+            if _is_known_garden_site(value):
+                options_by_value[str(value)] = {"label": f"{value} (common garden)", "value": value}
 
     options = list(options_by_value.values())
     valid_values = {option["value"] for option in options}
@@ -1452,10 +1627,11 @@ def display_click_data(click_data):
         State("map-year-filter", "value"),
         State("map-data-filter-col", "value"),
         State("map-data-filter-val", "value"),
+        State("map-availability-grid", "filterModel"),
     ],
     prevent_initial_call=True,
 )
-def toggle_individual_trees(relayout_data, selected_source, selected_locations, selected_years, data_filter_col, data_filter_val):
+def toggle_individual_trees(relayout_data, selected_source, selected_locations, selected_years, data_filter_col, data_filter_val, availability_filter_model):
     if not relayout_data:
         return no_update
 
@@ -1467,7 +1643,7 @@ def toggle_individual_trees(relayout_data, selected_source, selected_locations, 
     patched_fig = Patch()
 
     if zoom >= INDIVIDUAL_TREE_ZOOM_THRESHOLD:
-        tree_query = _build_coordinate_query(selected_source, selected_locations, selected_years, data_filter_col, data_filter_val)
+        tree_query = _build_coordinate_query(selected_source, selected_locations, selected_years, data_filter_col, data_filter_val, availability_filter_model)
         if not tree_query:
             return no_update
         tree_query = f"""
@@ -1515,6 +1691,7 @@ FROM (
         Output("california-map", "figure", allow_duplicate=True),
         Output("search-results-data", "children"),
         Output("search-result-store", "data"),
+        Output("search-status-indicator", "children"),
     ],
     [Input("search-trees-btn", "n_clicks"), Input("clear-search-btn", "n_clicks")],
     [
@@ -1523,10 +1700,11 @@ FROM (
         State("map-source-dropdown", "value"),
         State("map-location-filter", "value"),
         State("map-year-filter", "value"),
+        State("map-availability-grid", "filterModel"),
     ],
     prevent_initial_call=True,
 )
-def search_trees(search_clicks, clear_clicks, input_text, id_type, selected_source, selected_locations, selected_years):
+def search_trees(search_clicks, clear_clicks, input_text, id_type, selected_source, selected_locations, selected_years, availability_filter_model):
     trigger = callback_context.triggered[0]["prop_id"].split(".")[0] if callback_context.triggered else None
     patched_fig = Patch()
 
@@ -1535,39 +1713,59 @@ def search_trees(search_clicks, clear_clicks, input_text, id_type, selected_sour
         patched_fig["data"][4]["lon"] = []
         patched_fig["data"][4]["hovertext"] = []
         patched_fig["data"][4]["customdata"] = []
-        return patched_fig, html.Div("Search results cleared.", className="placeholder-card"), None
+        return patched_fig, html.Div("Search results cleared.", className="placeholder-card"), None, ""
 
     if not input_text or not input_text.strip():
-        return no_update, html.Div("Enter one or more identifiers to search.", className="placeholder-card"), no_update
+        return no_update, html.Div("Enter one or more identifiers to search.", className="placeholder-card"), no_update, ""
 
     raw_ids = input_text.replace("\n", ",").split(",")
-    ids = [value.strip() for value in raw_ids if value.strip()]
+    ids = _search_identifier_variants([value.strip() for value in raw_ids if value.strip()], id_type)
     if not ids:
-        return no_update, html.Div("No valid identifiers were provided.", className="placeholder-card"), no_update
+        return no_update, html.Div("No valid identifiers were provided.", className="placeholder-card"), no_update, ""
 
-    base_query = _build_coordinate_query(selected_source, selected_locations, selected_years)
-    if not base_query:
-        return no_update, html.Div("No mappable datasets are available for search.", className="placeholder-card"), None
+    table_name = _map_table_name(selected_source)
+    if not table_name:
+        return no_update, html.Div("No mappable datasets are available for search.", className="placeholder-card"), None, ""
 
+    available_columns = set(get_table_columns(table_name))
+    locality_col = _resolve_column_name(table_name, "locality_full_name") or _resolve_column_name(table_name, "Locality_full_name")
+    if not locality_col:
+        return no_update, html.Div("No mappable datasets are available for search.", className="placeholder-card"), None, ""
+
+    optional_selects = []
+    for column_name in OPTIONAL_MAP_COLUMNS:
+        if column_name in available_columns:
+            optional_selects.append(f"[{column_name}]")
+        else:
+            optional_selects.append(f"NULL AS [{column_name}]")
+
+    where_clause = _build_where_clause(table_name, selected_locations, selected_years, filter_model=availability_filter_model)
     ids_sql = ", ".join(_sql_literal(value) for value in ids)
+    id_col = _resolve_column_name(table_name, id_type)
+    if id_col:
+        where_clause += f" AND [{id_col}] IN ({ids_sql})"
+
     search_query = f"""
-SELECT *
-FROM (
-    {base_query}
-) q
-WHERE [{id_type}] IN ({ids_sql})
+SELECT TOP 10000
+    {_sql_literal(table_name)} AS [source_table],
+    [{locality_col}] AS [locality_full_name],
+    [Latitude],
+    [Longitude],
+    {', '.join(optional_selects)}
+FROM [dbo].[{table_name}]
+WHERE {where_clause}
 """
     try:
         df = _safe_fetch(search_query)
     except Exception:
-        return no_update, html.Div("Search is unavailable right now. Try a smaller dataset scope or try again later.", className="status-warning"), None
+        return no_update, html.Div("Search is unavailable right now. Try a smaller dataset scope or try again later.", className="status-warning"), None, ""
 
     if df is None or df.empty:
         patched_fig["data"][4]["lat"] = []
         patched_fig["data"][4]["lon"] = []
         patched_fig["data"][4]["hovertext"] = []
         patched_fig["data"][4]["customdata"] = []
-        return patched_fig, html.Div("No matching trees were found.", className="placeholder-card"), None
+        return patched_fig, html.Div("No matching trees were found.", className="placeholder-card"), None, ""
 
     map_df = df.dropna(subset=["Latitude", "Longitude"])
     patched_fig["data"][4]["lat"] = map_df["Latitude"].tolist()
@@ -1579,7 +1777,7 @@ WHERE [{id_type}] IN ({ids_sql})
         _tree_hover_text(row)
         for _, row in map_df.iterrows()
     ]
-    patched_fig["data"][4]["customdata"] = map_df[["source_table", "locality_full_name"]].values.tolist()
+    patched_fig["data"][4]["customdata"] = map_df[["source_table", "Latitude", "Longitude", "locality_full_name"]].values.tolist()
 
     store_data = {"records": df.to_dict("records"), "filename": "search_results.csv"}
     result_card = html.Div(
@@ -1597,7 +1795,7 @@ WHERE [{id_type}] IN ({ids_sql})
         ],
         className="panel-card",
     )
-    return patched_fig, result_card, store_data
+    return patched_fig, result_card, store_data, ""
 
 
 @callback(

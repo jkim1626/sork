@@ -1,7 +1,6 @@
 import logging
 
-import dash
-from dash import dcc, html, Input, Output, State, callback, ctx
+from dash import dcc, html, Input, Output, State, callback
 from dash.exceptions import PreventUpdate
 from dash_ag_grid import AgGrid
 from database import fetch_data_from_sql
@@ -9,7 +8,6 @@ from data_access import (
     DatabaseAccessError,
     fetch_table_rows,
     get_allowed_tables,
-    get_column_distinct_values,
     get_table_display_name,
 )
 from dotenv import load_dotenv
@@ -87,16 +85,11 @@ download_layout = dcc.Tab(
             [
                 html.H4("Data Browser", className="page-title"),
                 html.P(
-                    "View available tables.",
+                    "Choose a database table to preview or download as a flat file.",
                     className="page-intro",
                 ),
             ],
             className="page-header-block",
-        ),
-        dcc.Loading(
-            id="download-overview-loading",
-            type="default",
-            children=html.Div(id="download-table-overview", className="file-table-grid"),
         ),
         html.Div(
             [
@@ -115,7 +108,7 @@ download_layout = dcc.Tab(
                                 html.H6("Limit Rows", className="section-title"),
                                 dcc.Checklist(
                                     id="download-limit-toggle",
-                                    options=[{"label": " Limit rows", "value": "limit"}],
+                                    options=[{"label": " Limit preview rows", "value": "limit"}],
                                     value=["limit"],
                                     inline=True,
                                 ),
@@ -135,44 +128,14 @@ download_layout = dcc.Tab(
                         ),
                         html.Div(
                             [
-                                html.H6("Simple Filter", className="section-title"),
-                                html.P("Optional: choose one column and one or more values before refreshing the preview.", className="section-copy"),
-                                dcc.Dropdown(id="download-filter-column", options=[], value=None, placeholder="Filter column"),
-                                dcc.Dropdown(id="download-filter-values", options=[], value=[], multi=True, placeholder="Values"),
-                            ],
-                            className="panel-card",
-                        ),
-                        html.Div(
-                            [
-                                html.H6("Columns", className="section-title"),
-                                html.Div(
-                                    [
-                                        html.Button("Select All", id="download-select-all-btn", n_clicks=0, className="btn btn-outline-secondary btn-sm"),
-                                        html.Button("Deselect All", id="download-deselect-all-btn", n_clicks=0, className="btn btn-outline-secondary btn-sm"),
-                                    ],
-                                    className="button-row",
-                                ),
-                                dcc.Checklist(
-                                    id="download-columns",
-                                    options=[],
-                                    value=[],
-                                    inline=False,
-                                    labelStyle={"display": "block", "marginBottom": "3px"},
-                                    className="column-checklist",
-                                ),
-                            ],
-                            className="panel-card",
-                        ),
-                        html.Div(
-                            [
-                                html.Button("Refresh Preview", id="preview-button", className="btn btn-success"),
+                                html.Button("Refresh Preview", id="preview-button", n_clicks=0, className="btn btn-success"),
                                 html.Button("Download Flat File", id="download-button", className="btn btn-outline-secondary"),
                                 dcc.Download(id="download-dataframe-csv"),
                             ],
                             className="button-row",
                         ),
                         html.Div(
-                            "Downloads include all rows for the selected table. Row limits only affect the preview.",
+                            "Row limits only affect the preview; downloads include all rows and columns.",
                             className="section-copy",
                         ),
                         dcc.Loading(
@@ -218,8 +181,6 @@ def set_download_tab_active(main_tab, sub_tab):
     [Output('download_table_dropdown', 'value', allow_duplicate=True),
      Output('download-start-row', 'value', allow_duplicate=True),
      Output('download-end-row', 'value', allow_duplicate=True),
-     Output('download-columns', 'options', allow_duplicate=True),
-     Output('download-columns', 'value', allow_duplicate=True),
      Output('download-row-info', 'children', allow_duplicate=True),
      Output('download-preview', 'children', allow_duplicate=True),
      Output('download-status', 'children', allow_duplicate=True),
@@ -242,108 +203,20 @@ def show_download_container(selected_table):
 
 
 @callback(
-    Output("download-table-overview", "children"),
-    Input("download-tab-active", "data")
-)
-def render_table_overview(is_active):
-    if not is_active:
-        raise PreventUpdate
-    cards = []
-    for table_info in table_options:
-        table_name = table_info["value"]
-        table_label = table_info["label"]
-        try:
-            row_count = _get_table_row_count_direct(table_name)
-            columns = _get_table_columns_direct(table_name)
-            body = f"{row_count:,} rows · {len(columns):,} columns"
-        except DatabaseAccessError as exc:
-            logger.exception("Unable to summarize table %s", table_name)
-            body = "Unavailable"
-        cards.append(
-            html.Div(
-                [
-                    html.Div(table_label, className="summary-card-title"),
-                    html.Div(body, className="summary-card-body"),
-                ],
-                className="summary-card file-table-card",
-            )
-        )
-    return cards or html.Div("No source tables are configured for browsing.", className="placeholder-card")
-
-# Callback to get columns and row info
-@callback(
-    [Output("download-columns", "options"),
-     Output("download-columns", "value"),
-     Output("download-row-info", "children"),
-     Output("download-end-row", "max")],
+    Output("download-row-info", "children"),
     [Input("download_table_dropdown", "value")]
 )
-def update_column_options(selected_table):
+def update_table_info(selected_table):
     if not selected_table:
-        return [], [], "", 100
+        return ""
     
     try:
         columns = _get_table_columns_direct(selected_table)
-        column_options = [{'label': col, 'value': col} for col in columns]
-        
         total_rows = _get_table_row_count_direct(selected_table)
-        
-        row_info = f"{total_rows:,} rows available in this table."
-        
-        # Return all columns selected by default
-        return column_options, columns, row_info, total_rows
+        return f"{total_rows:,} rows and {len(columns):,} columns available in this table."
     except DatabaseAccessError as e:
         logger.exception("Unable to load file browser metadata for %s", selected_table)
-        return [], [], "Table details are unavailable right now.", 100
-
-# Callback to handle select/deselect all columns
-@callback(
-    Output("download-columns", "value", allow_duplicate=True),
-    [Input("download-select-all-btn", "n_clicks"),
-     Input("download-deselect-all-btn", "n_clicks")],
-    [State("download-columns", "options"),
-     State("download-columns", "value")],
-    prevent_initial_call=True
-)
-def handle_column_selection(select_all, deselect_all, options, current_values):
-    triggered_id = ctx.triggered_id if ctx.triggered_id else 'no-id'
-    
-    if triggered_id == "download-select-all-btn":
-        return [option["value"] for option in options]
-    elif triggered_id == "download-deselect-all-btn":
-        return []
-    
-    return current_values
-
-
-@callback(
-    [Output("download-filter-column", "options"), Output("download-filter-column", "value")],
-    Input("download_table_dropdown", "value")
-)
-def update_filter_column_options(selected_table):
-    if not selected_table:
-        return [], None
-    try:
-        columns = _get_table_columns_direct(selected_table)
-        return [{"label": column, "value": column} for column in columns], None
-    except DatabaseAccessError:
-        logger.exception("Unable to load filter columns for %s", selected_table)
-        return [], None
-
-
-@callback(
-    [Output("download-filter-values", "options"), Output("download-filter-values", "value")],
-    [Input("download_table_dropdown", "value"), Input("download-filter-column", "value")]
-)
-def update_filter_values(selected_table, filter_column):
-    if not selected_table or not filter_column:
-        return [], []
-    try:
-        values = get_column_distinct_values(selected_table, filter_column)
-        return [{"label": str(value), "value": value} for value in values], []
-    except DatabaseAccessError:
-        logger.exception("Unable to load filter values for %s.%s", selected_table, filter_column)
-        return [], []
+        return "Table details are unavailable right now."
 
 
 @callback(
@@ -383,69 +256,49 @@ def update_download_button_label(selected_table):
      Input("download_table_dropdown", "value")],
     [State("download-start-row", "value"),
      State("download-end-row", "value"),
-     State("download-columns", "value"),
-     State("download-limit-toggle", "value"),
-     State("download-filter-column", "value"),
-     State("download-filter-values", "value")]
+     State("download-limit-toggle", "value")]
 )
-def update_preview(n_clicks, selected_table, start_row, end_row, selected_columns, limit_toggle, filter_column, filter_values):
-    if not selected_table or not selected_columns:
+def update_preview(n_clicks, selected_table, start_row, end_row, limit_toggle):
+    if not selected_table:
         return _empty_state("Choose a table to preview source rows."), []
-    
-    use_limit = limit_toggle and "limit" in limit_toggle
-    if use_limit:
-        if not start_row or start_row < 1:
-            start_row = 1
-        if not end_row or end_row < start_row:
-            end_row = start_row + 99
-        row_count = end_row - start_row + 1
-        preview_max_rows = row_count
-    else:
-        start_row = 1
-        try:
-            row_count = _get_table_row_count_direct(selected_table)
-        except DatabaseAccessError:
-            logger.exception("Unable to count rows for %s before full preview", selected_table)
-            return _friendly_error(), html.Div("Preview could not be generated.", className="section-copy")
-        preview_max_rows = row_count
 
-    filters = {filter_column: filter_values} if filter_column and filter_values else None
-    
     try:
+        selected_columns = _get_table_columns_direct(selected_table)
+        use_limit = limit_toggle and "limit" in limit_toggle
+        if use_limit:
+            if not start_row or start_row < 1:
+                start_row = 1
+            if not end_row or end_row < start_row:
+                end_row = start_row + 99
+            row_count = end_row - start_row + 1
+            preview_max_rows = row_count
+            requested_text = f"rows {start_row:,}-{end_row:,}"
+        else:
+            start_row = 1
+            row_count = _get_table_row_count_direct(selected_table)
+            preview_max_rows = row_count
+            requested_text = "the entire dataset"
+
         preview_df = fetch_table_rows(
             selected_table,
             selected_columns,
             start_row=start_row,
             row_count=row_count,
             max_rows=preview_max_rows,
-            filters=filters,
         )
 
         if preview_df.empty:
-            return _empty_state("No rows matched this range or filter."), html.Div("Adjust the row range or clear filters.", className="section-copy")
-        
-        requested_text = (
-            f"rows {start_row:,}-{end_row:,}"
-            if use_limit
-            else "the entire dataset"
-        )
-        preview = []
-        if not use_limit:
-            preview.append(
-                html.Div(
-                    "Row limiting is off. Loading the full preview may take time for large tables.",
-                    className="status-warning",
-                )
-            )
-        preview.extend([
+            return _empty_state("No rows are available in this table."), html.Div("Choose another table.", className="section-copy")
+
+        preview = [
             html.P(
                 f"Previewing {len(preview_df):,} rows from {requested_text}. Sort or filter columns inside the grid.",
                 className="section-copy",
             ),
             _make_grid(preview_df, "download-preview-grid"),
-        ])
+        ]
         status = html.Div(
-            f"Preview loaded for {selected_table}. Filters are applied before the row range.",
+            f"Preview loaded for {selected_table}.",
             className="section-copy",
         )
         return preview, status
@@ -458,17 +311,17 @@ def update_preview(n_clicks, selected_table, start_row, end_row, selected_column
     [Output("download-dataframe-csv", "data"),
      Output("download-status", "children", allow_duplicate=True)],
     [Input("download-button", "n_clicks")],
-    [State("download_table_dropdown", "value"),
-     State("download-columns", "value")],
+    [State("download_table_dropdown", "value")],
     prevent_initial_call=True
 )
-def download_csv(n_clicks, selected_table, selected_columns):
-    if not n_clicks or not selected_table or not selected_columns:
+def download_csv(n_clicks, selected_table):
+    if not n_clicks or not selected_table:
         raise PreventUpdate
 
     start_row = 1
     try:
         row_count = _get_table_row_count_direct(selected_table)
+        selected_columns = _get_table_columns_direct(selected_table)
     except DatabaseAccessError:
         logger.exception("Unable to count rows for %s before download", selected_table)
         return None, _friendly_error("Download unavailable")

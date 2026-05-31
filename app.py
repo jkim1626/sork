@@ -120,7 +120,7 @@ FLAT_FILE_SUBTAB_SELECTED_STYLE = {
     "boxShadow": "0 6px 14px rgba(24, 47, 32, 0.08)",
 }
 
-# Create a combined "Flat File Downloads" tab with upload and download as sub-tabs
+# Create a combined flat-file tab with upload and download as sub-tabs
 flat_files_layout = dcc.Tab(
     [
         dcc.Tabs(
@@ -150,7 +150,7 @@ flat_files_layout = dcc.Tab(
             parent_className="flat-files-subtabs__parent",
         )
     ],
-    label="Flat File Downloads",
+    label="Flat File Downloads/Uploads",
     id="flat-files-tab",
     style={"padding": "15px", "display": "flex", "flexDirection": "column", "flex": "1 1 auto", "minHeight": 0}
 )
@@ -158,10 +158,10 @@ flat_files_layout = dcc.Tab(
 TAB_SPECS = [
     ("Select and Filter", joins_layout),
     ("Tree Sites", map_layout),
-    ("Flat File Downloads", flat_files_layout),
+    ("Flat File Downloads/Uploads", flat_files_layout),
 ]
 
-# Guest-facing tab set — Select & Filter and Map only (no uploads, no flat file downloads)
+# Guest-facing tab set — Select & Filter and Map only (no uploads or flat-file downloads)
 GUEST_TAB_SPECS = [
     ("Select and Filter", joins_layout),
     ("Tree Sites", map_layout),

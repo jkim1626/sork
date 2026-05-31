@@ -302,6 +302,13 @@ button.login-button {
     gap: 14px;
 }
 
+.map-and-availability {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+    gap: 14px;
+    align-items: stretch;
+}
+
 .map-graph {
     border: 1px solid var(--shell-border);
     border-radius: 8px;
@@ -356,6 +363,7 @@ button.login-button {
 
 .map-availability-card {
     padding: 12px 14px;
+    height: 100%;
 }
 
 .map-availability-card .section-copy {
@@ -490,6 +498,31 @@ button.login-button {
 .ag-theme-alpine.compact-grid .ag-header-cell-label,
 .ag-theme-alpine.compact-grid .ag-cell {
     overflow: visible;
+}
+
+.ag-theme-alpine.upload-schema-grid .ag-root-wrapper {
+    overflow: hidden;
+}
+
+.ag-theme-alpine.upload-schema-grid .ag-header-cell-label,
+.ag-theme-alpine.upload-schema-grid .ag-cell {
+    overflow: hidden;
+}
+
+.ag-theme-alpine.upload-schema-grid .ag-cell,
+.ag-theme-alpine.upload-schema-grid .ag-cell-value,
+.ag-theme-alpine.upload-schema-grid .ag-header-cell-text {
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: normal;
+    line-height: 1.28;
+}
+
+.ag-theme-alpine.upload-schema-grid .ag-cell {
+    display: flex;
+    align-items: flex-start;
+    padding-top: 8px;
+    padding-bottom: 8px;
 }
 
 .upload-workspace,
@@ -846,6 +879,10 @@ button.login-button {
     }
 
     .map-workspace {
+        grid-template-columns: 1fr;
+    }
+
+    .map-and-availability {
         grid-template-columns: 1fr;
     }
 

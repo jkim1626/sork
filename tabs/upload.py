@@ -10,10 +10,10 @@ from dash_ag_grid import AgGrid
 from data_access import (
     DatabaseAccessError,
     append_dataframe_to_holding_table,
-    get_allowed_tables,
-    get_table_columns,
-    get_table_schema_preview,
     get_table_display_name,
+    get_upload_template_columns,
+    get_upload_template_schema_preview,
+    get_upload_template_tables,
 )
 from dotenv import load_dotenv
 
@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 # Table Options - create options with descriptive labels
-_table_list = get_allowed_tables()
+_table_list = get_upload_template_tables()
 table_options = [
     {"label": get_table_display_name(table), "value": table}
     for table in _table_list
@@ -38,6 +38,14 @@ def _status(message, kind="warning", title=None):
 
 
 def _make_grid(df, grid_id, height=320):
+    schema_grid = grid_id == "upload-schema-grid"
+    schema_widths = {
+        "Position": {"width": 95, "minWidth": 90, "maxWidth": 120},
+        "Column": {"width": 190, "minWidth": 160},
+        "Type": {"width": 150, "minWidth": 130},
+        "Required": {"width": 280, "minWidth": 220},
+        "Description": {"width": 520, "minWidth": 360},
+    }
     return AgGrid(
         id=grid_id,
         rowData=df.to_dict("records"),
@@ -48,13 +56,26 @@ def _make_grid(df, grid_id, height=320):
                 "filter": True,
                 "sortable": True,
                 "resizable": True,
-                "minWidth": 120,
+                "wrapText": schema_grid,
+                "autoHeight": schema_grid,
+                **(schema_widths.get(str(column), {"minWidth": 120}) if schema_grid else {"minWidth": 120}),
             }
             for column in df.columns
         ],
-        defaultColDef={"filter": True, "sortable": True, "resizable": True},
-        dashGridOptions={"pagination": True, "paginationPageSize": 10, "animateRows": False},
-        className="ag-theme-alpine compact-grid",
+        defaultColDef={
+            "filter": True,
+            "sortable": True,
+            "resizable": True,
+            "wrapHeaderText": schema_grid,
+            "autoHeaderHeight": schema_grid,
+        },
+        dashGridOptions={
+            "pagination": True,
+            "paginationPageSize": 10,
+            "animateRows": False,
+            "ensureDomOrder": True,
+        },
+        className=f"ag-theme-alpine compact-grid{' upload-schema-grid' if schema_grid else ''}",
         style={"width": "100%", "height": f"{height}px"},
     )
 
@@ -95,9 +116,15 @@ def _schema_for_display(schema_df):
             "Position": df["ORDINAL_POSITION"] if "ORDINAL_POSITION" in df.columns else range(1, len(df) + 1),
             "Column": df["COLUMN_NAME"],
             "Type": df.apply(format_type, axis=1),
-            "Required": df.get("IS_NULLABLE", pd.Series(["YES"] * len(df))).map(lambda v: "Yes" if str(v).upper() == "NO" else "No"),
+            "Required": (
+                df["REQUIRED_RULE"]
+                if "REQUIRED_RULE" in df.columns
+                else df.get("IS_NULLABLE", pd.Series(["YES"] * len(df))).map(lambda v: "Yes" if str(v).upper() == "NO" else "No")
+            ),
         }
     )
+    if "COLUMN_DESCRIPTION" in df.columns:
+        display["Description"] = df["COLUMN_DESCRIPTION"]
     return display
 
 
@@ -255,7 +282,7 @@ def display_table_structure(selected_table):
         return []
     
     try:
-        schema_df = get_table_schema_preview(selected_table)
+        schema_df = get_upload_template_schema_preview(selected_table)
         schema_display = _schema_for_display(schema_df)
         
         structure_info = [
@@ -319,7 +346,7 @@ def validate_and_preview_csv(contents, selected_table, filename):
         return [], [], True
     
     try:
-        table_columns = get_table_columns(selected_table)
+        table_columns = get_upload_template_columns(selected_table)
         
         df, error = parse_excel(contents, filename)
         if error:
@@ -424,7 +451,7 @@ def download_upload_template(n_clicks, selected_table):
         raise PreventUpdate
 
     try:
-        schema_df = get_table_schema_preview(selected_table)
+        schema_df = get_upload_template_schema_preview(selected_table)
         workbook_bytes = _build_template_workbook(selected_table, schema_df)
         filename = f"{selected_table}_upload_template.xlsx"
         return dcc.send_bytes(
