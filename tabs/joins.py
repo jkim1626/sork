@@ -1,14 +1,48 @@
-from dash import dcc, html, Input, Output, State, callback, ctx
+import logging
+# pyrefly: ignore [missing-import]
+from dash import dcc, html, Input, Output, State, callback, ctx, clientside_callback
 from dash.exceptions import PreventUpdate
 import dash
 from dotenv import load_dotenv
-from database import fetch_data_from_sql
+from database import fetch_data_from_sql, fetch_data_from_sql_public
+from flask import session as flask_session
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from dash_ag_grid import AgGrid
 
+import plotly.graph_objects as go
+import plotly.express as px
+from scipy import stats
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+
+# Statistical test options
+MIN_ROWS_FOR_REGRESSION = 3
+MIN_ROWS_FOR_PCA = 3
+MIN_VARS_FOR_PCA = 2
+
+stat_test_options = [
+    {'label': 'Linear Regression', 'value': 'linear_regression'},
+    {'label': 'Principal Component Analysis (PCA)', 'value': 'pca'},
+    {'label': 'Summary Statistics', 'value': 'summary_stats'},
+    {'label': 'Plot Data (No Test)', 'value': 'plot_data'}
+]
+
 # Load environment variables
 load_dotenv(override=True)
+logger = logging.getLogger(__name__)
+
+
+def _fetch_for_user(query, raise_on_error=False):
+    """Route DB query through the correct credential tier.
+
+    Authenticated users use the standard read role; guests use qplad_public.
+    """
+    if 'user' in flask_session:
+        return fetch_data_from_sql(query, raise_on_error=raise_on_error)
+    return fetch_data_from_sql_public(query, raise_on_error=raise_on_error)
+
 
 # ===== CONFIGURATION CONSTANTS =====
 
@@ -25,29 +59,128 @@ CORE_TABLES = {
 }
 
 MATERNAL_TREE_TABLE = "Valley oak maternal tree climate data BCM 2018_03_08"
-GARDENS_TABLE = "gardens_20152023prismmonthly"
+CORE_JOIN_KEYS_BY_TABLE = {
+    "leaf_traits_2016": ["Accession", "Locality", "Site"],
+}
+DEFAULT_CORE_JOIN_KEYS = ["Accession", "Locality", "Year", "Site"]
+TREE_JOIN_KEYS = {"Accession", "Locality"}
+CALCULATED_COLUMN_OPERATIONS = [
+    {"label": "Add", "value": "add"},
+    {"label": "Subtract", "value": "subtract"},
+    {"label": "Multiply", "value": "multiply"},
+    {"label": "Divide", "value": "divide"},
+    {"label": "Difference from mean (one variable)", "value": "center"},
+]
 
 # Whitelists for validation
 ALLOWED_CORE_TABLES = set(CORE_TABLES.keys())
 
+
+def _required_core_cols(core_table):
+    return CORE_JOIN_KEYS_BY_TABLE.get(core_table, DEFAULT_CORE_JOIN_KEYS)
+
+
+def _hide_join_key_options(columns, hidden_keys):
+    hidden = set(hidden_keys or [])
+    return [{'label': c, 'value': c} for c in columns if c not in hidden]
+
+
+
+
+
+def _is_numeric_like(series):
+    try:
+        if is_numeric_dtype(series):
+            return True
+        sample = pd.to_numeric(series.dropna().head(TYPE_DETECTION_SAMPLE_SIZE), errors='coerce')
+        return len(sample) > 0 and sample.notna().sum() / float(len(sample)) >= NUMERIC_THRESHOLD
+    except Exception:
+        return False
+
+
+def _column_category(column_name, series):
+    name = str(column_name).lower()
+    if any(token in name for token in ("id", "site", "year", "month", "date", "accession", "locality", "tree", "plot", "sample")):
+        return "Identifier"
+    if _is_numeric_like(series):
+        return "Numeric"
+    try:
+        if series.dropna().nunique() <= 25:
+            return "Category"
+    except Exception:
+        pass
+    return "Other"
+
+
+def _analysis_option(column_name, series):
+    return {"label": f"{_column_category(column_name, series)}: {column_name}", "value": column_name}
+
+
+def _safe_calculated_column_name(name):
+    cleaned = "".join(c if c.isalnum() or c == "_" else "_" for c in str(name or "").strip()).strip("_")
+    return cleaned or None
+
+
+def _calculated_column_series(df, operation, left_col, right_col=None):
+    if left_col not in df.columns:
+        raise ValueError("Select a valid first variable.")
+    left = pd.to_numeric(df[left_col], errors="coerce")
+
+    if operation == "center":
+        return left - left.mean()
+
+    if operation in {"add", "subtract", "multiply", "divide"}:
+        if right_col not in df.columns:
+            raise ValueError("Select a valid second variable.")
+        right = pd.to_numeric(df[right_col], errors="coerce")
+        if operation == "add":
+            return left + right
+        if operation == "subtract":
+            return left - right
+        if operation == "multiply":
+            return left * right
+        if operation == "divide":
+            return left / right.replace({0: np.nan})
+
+    raise ValueError("Choose a supported calculation.")
+
+
+def _calculated_column_options(column_names):
+    return [{"label": name, "value": name} for name in (column_names or [])]
+
+
+def _remove_column_def(column_defs, column_name):
+    return [
+        col_def
+        for col_def in (column_defs or [])
+        if col_def.get("field") != column_name
+    ]
+
 # Create a layout for the joins tab
 joins_layout = dcc.Tab(
-    label="Table Joins",
+    label="Select and Filter",
     id="joins-tab",
-    style={"padding": "15px"},
+    style={"padding": "15px", "display": "flex", "flexDirection": "column", "flex": "1 1 auto", "minHeight": 0},
     children=[
         dcc.Store(id='joins-tab-active', data=False),
         dcc.Store(id='join-tab-full-query', data=None),  # Store the SQL query instead of data
         dcc.Store(id='joins-metadata-store', data={}),  # Cache metadata (column lists)
-        html.Div(
-            [
+        dcc.Store(id='join-available-years', data=[]),  # Store available years for filtering
+        dcc.Store(id='calculated-columns-store', data=[]),
+        html.Div(className="d-flex w-100", id="join-split-container", style={"display": "flex", "flex": "1 1 auto", "flexDirection": "row", "alignItems": "stretch", "maxWidth": "98%", "margin": "0 auto", "padding": "0 20px"}, children=[
+            # LEFT COLUMN: Selection (Draggable)
+            html.Div(id="join-left-pane", style={"flex": "0 0 auto", "width": "30%", "minWidth": "20%", "maxWidth": "85%", "overflowX": "hidden", "overflowY": "auto", "paddingRight": "20px", "height": "100%"}, children=[
+
                 # Introduction section
                 html.Div([
-                    html.H4("Join Your Data", style={"marginBottom": "10px", "color": "#133817"}),
+                    html.H4("Select & Filter Data", style={"marginBottom": "10px", "color": "#133817"}),
                     html.P(
-                        "Automatically combines your garden dataset with maternal tree climate data and garden climate data. "
-                        "All columns are selected by default. Please uncheck any you don't need.",
+                        "Choose one dataset or combine datasets only when needed. Required identifiers and join keys are included automatically, so they are not shown in the variable dropdowns.",
                         style={"color": "#666", "marginBottom": "20px", "fontSize": "0.95em"}
+                    ),
+                    html.Div(
+                        "Larger joins and exports may take a while, so the preview is limited by default.",
+                        style={"backgroundColor": "#fff3cd", "border": "1px solid #ffe69c", "padding": "10px 12px", "borderRadius": "6px", "fontSize": "0.9em"},
                     ),
                 ], style={"marginBottom": "25px", "padding": "15px", "backgroundColor": "#f0f7f2", "borderRadius": "8px"}),
 
@@ -65,74 +198,65 @@ joins_layout = dcc.Tab(
                 # Error message for general errors
                 html.Div(id="join-tab-general-error", style={"color": "red", "marginTop": "10px", "fontWeight": "bold", "textAlign": "center"}),
 
-                # Step 2: Core table columns (in a card)
+                # Step 2: Pre-join filters (Year filter)
                 html.Div([
+                    html.H5("Step 2: Pre-Join Filters (Optional)", style={"fontWeight": "bold", "marginBottom": "10px", "color": "#133817"}),
+                    html.P("Filter data before joining to reduce dataset size. Leave empty to include all.",
+                           style={"color": "#666", "marginBottom": "8px", "fontSize": "0.9em"}),
                     html.Div([
-                        html.H5("Garden Dataset Columns", style={"fontWeight": "bold", "marginBottom": "5px", "color": "#133817"}),
-                        html.P("All columns are selected by default. Uncheck any you don't need.", 
-                               style={"color": "#666", "fontSize": "0.85em", "marginBottom": "10px"}),
-                        html.Div([
-                            html.Button("Select All", id="join-select_all_btn", n_clicks=0, 
-                                      style={"marginRight": "10px", "fontSize": "0.85em", "padding": "5px 12px", 
-                                            "backgroundColor": "#007bff", "color": "white", "border": "none", "borderRadius": "4px", "cursor": "pointer"}),
-                            html.Button("Deselect All", id="join-deselect_all_btn", n_clicks=0, 
-                                      style={"fontSize": "0.85em", "padding": "5px 12px", 
-                                            "backgroundColor": "#6c757d", "color": "white", "border": "none", "borderRadius": "4px", "cursor": "pointer"}),
-                        ], style={"marginBottom": "10px"}),
+                        html.Label("Filter by Year(s):", style={"fontWeight": "bold", "marginBottom": "5px", "fontSize": "0.9em"}),
+                        dcc.Dropdown(
+                            id="join-year-filter",
+                            options=[],
+                            value=[],
+                            multi=True,
+                            placeholder="All years (no filter)",
+                            style={"marginBottom": "10px"}
+                        ),
                     ]),
-                    dcc.Checklist(id="join-core-table-options", options=[], value=[], inline=False,
-                                labelStyle={"display": "block", "marginBottom": "5px", "padding": "3px"},
-                                style={"maxHeight": "250px", "overflowY": "auto", "padding": "10px", 
-                                      "backgroundColor": "#f9f9f9", "borderRadius": "5px"}),
+                    html.Div([
+                        html.Label("Filter by Site(s):", style={"fontWeight": "bold", "marginBottom": "5px", "fontSize": "0.9em"}),
+                        dcc.Dropdown(
+                            id="join-site-filter",
+                            options=[],
+                            value=[],
+                            multi=True,
+                            placeholder="All sites (no filter)",
+                        ),
+                    ]),
+                ], id="join-prefilter-container", style={"display": "none", "marginBottom": "25px", "padding": "15px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}),
+
+                # Step 3: Core table columns — multi-select dropdown
+                html.Div([
+                    html.H5("Step 3: Garden Dataset Columns", style={"fontWeight": "bold", "marginBottom": "5px", "color": "#133817"}),
+                    html.P("No columns selected by default. Join keys such as Accession, Locality, Site, and Year are included automatically when needed.", 
+                           style={"color": "#666", "fontSize": "0.85em", "marginBottom": "10px"}),
+                    dcc.Dropdown(
+                        id="join-core-table-options",
+                        options=[],
+                        value=[],
+                        multi=True,
+                        placeholder="Select columns...",
+                    ),
                 ], id="join-table-columns-container", style={"display": "none", "marginBottom": "20px", 
                                                               "padding": "15px", "backgroundColor": "#ffffff", 
                                                               "borderRadius": "8px", "border": "1px solid #e0e0e0"}),
 
-                # Step 3: Maternal tree table columns (in a card)
+                # Step 4: Maternal tree table columns — multi-select dropdown
                 html.Div([
-                    html.Div([
-                        html.H5("Maternal Tree Climate Data", style={"fontWeight": "bold", "marginBottom": "5px", "color": "#133817"}),
-                        html.P("Climate data from the original tree locations. Automatically matched by Accession and Locality.", 
-                               style={"color": "#666", "fontSize": "0.85em", "marginBottom": "10px"}),
-                        html.Div([
-                            html.Button("Select All", id="join-select_all_btn-2", n_clicks=0, 
-                                      style={"marginRight": "10px", "fontSize": "0.85em", "padding": "5px 12px", 
-                                            "backgroundColor": "#007bff", "color": "white", "border": "none", "borderRadius": "4px", "cursor": "pointer"}),
-                            html.Button("Deselect All", id="join-deselect_all_btn-2", n_clicks=0, 
-                                      style={"fontSize": "0.85em", "padding": "5px 12px", 
-                                            "backgroundColor": "#6c757d", "color": "white", "border": "none", "borderRadius": "4px", "cursor": "pointer"}),
-                        ], style={"marginBottom": "10px"}),
-                    ]),
-                    dcc.Checklist(id="join-tree-table-options", options=[], value=[], inline=False,
-                                labelStyle={"display": "block", "marginBottom": "5px", "padding": "3px"},
-                                style={"maxHeight": "250px", "overflowY": "auto", "padding": "10px", 
-                                      "backgroundColor": "#f9f9f9", "borderRadius": "5px"}),
+                    html.H5("Step 4: Maternal Tree Climate Data", style={"fontWeight": "bold", "marginBottom": "5px", "color": "#133817"}),
+                    html.P("Climate data from original tree locations. Optional: select these variables to join by Accession and Locality. You can also leave this section empty.", 
+                           style={"color": "#666", "fontSize": "0.85em", "marginBottom": "10px"}),
+                    dcc.Dropdown(
+                        id="join-tree-table-options",
+                        options=[],
+                        value=[],
+                        multi=True,
+                        placeholder="Select columns...",
+                    ),
                 ], id="join-tree-table-columns-container", style={"display": "none", "marginBottom": "20px",
                                                                     "padding": "15px", "backgroundColor": "#ffffff", 
                                                                     "borderRadius": "8px", "border": "1px solid #e0e0e0"}),
-
-                # Step 4: Garden climate variables (in a card)
-                html.Div([
-                    html.Div([
-                        html.H5("Garden Climate Data", style={"fontWeight": "bold", "marginBottom": "5px", "color": "#133817"}),
-                        html.P("Monthly climate data from garden sites. Automatically matched by Site (and Year, if available).", 
-                               style={"color": "#666", "fontSize": "0.85em", "marginBottom": "10px"}),
-                        html.Div([
-                            html.Button("Select All", id="join-select_all_btn-3", n_clicks=0, 
-                                      style={"marginRight": "10px", "fontSize": "0.85em", "padding": "5px 12px", 
-                                            "backgroundColor": "#007bff", "color": "white", "border": "none", "borderRadius": "4px", "cursor": "pointer"}),
-                            html.Button("Deselect All", id="join-deselect_all_btn-3", n_clicks=0, 
-                                      style={"fontSize": "0.85em", "padding": "5px 12px", 
-                                            "backgroundColor": "#6c757d", "color": "white", "border": "none", "borderRadius": "4px", "cursor": "pointer"}),
-                        ], style={"marginBottom": "10px"}),
-                    ]),
-                    dcc.Checklist(id="join-garden-table-options", options=[], value=[], inline=False,
-                                labelStyle={"display": "block", "marginBottom": "5px", "padding": "3px"},
-                                style={"maxHeight": "250px", "overflowY": "auto", "padding": "10px", 
-                                      "backgroundColor": "#f9f9f9", "borderRadius": "5px"}),
-                ], id="join-garden-table-columns-container", style={"display": "none", "marginBottom": "20px",
-                                                                     "padding": "15px", "backgroundColor": "#ffffff", 
-                                                                     "borderRadius": "8px", "border": "1px solid #e0e0e0"}),
 
                 # Join preview section (shows before execution)
                 html.Div([
@@ -162,20 +286,63 @@ joins_layout = dcc.Tab(
                         }
                     )
                 ], id="join-tab-execute-button-div", style={"display": "none", "textAlign": "center", "marginTop": "20px", "marginBottom": "20px"}),
+            ]), # END LEFT COLUMN
 
-                # Row count input (similar to dataset.py) with debouncing
+            # FULL HEIGHT DRAGGABLE DIVIDER
+            html.Div(id="join-drag-divider", style={
+                "width": "6px", 
+                "height": "100%",
+                "cursor": "col-resize", 
+                "backgroundColor": "#f4f4f4", 
+                "borderLeft": "1px solid #ddd",
+                "borderRight": "1px solid #ddd",
+                "zIndex": 10,
+                "transition": "background-color 0.2s",
+                "flexShrink": 0
+            }),
+            
+            # RIGHT COLUMN: Results & Analysis
+            html.Div(id="join-right-pane", style={"flex": "1 1 auto", "overflowY": "auto", "paddingLeft": "20px", "minWidth": "100px", "height": "100%"}, children=[
+
+                # Placeholder shown when no data is loaded
                 html.Div([
-                    html.Label("Number of rows to display:", style={"fontWeight": "bold"}),
-                    dcc.Input(id="join-row-count", type="number", min=1, max=1000000, value=20,
-                            style={"width": "100px", "margin": "10px 0"}, debounce=True),
-                    html.Span(id="join-max-rows-info", style={"marginLeft": "10px", "color": "#666", "fontSize": "0.9em"}),
+                    html.Div("Select your data and click Join to see results here.", 
+                             style={"color": "#999", "fontSize": "1.1em", "textAlign": "center", "marginTop": "40px"}),
+                ], id="join-right-placeholder", style={"display": "block", "height": "100%"}),
+
+                # Row limit toggle, height filter toggle, and input
+                html.Div([
+                    html.Div([
+                        dcc.Checklist(
+                            id="join-limit-rows-toggle",
+                            options=[{"label": " Limit rows displayed", "value": "limit"}],
+                            value=[],
+                            inline=True,
+                            style={"fontWeight": "bold", "display": "inline-block", "marginRight": "15px"}
+                        ),
+                        html.Span(id="join-max-rows-info", style={"color": "#666", "fontSize": "0.9em"}),
+                    ], style={"display": "flex", "alignItems": "center", "marginBottom": "8px"}),
+                    html.Div([
+                        html.Label("Max rows:", style={"marginRight": "8px"}),
+                        dcc.Input(id="join-row-count", type="number", min=1, max=1000000, value=100,
+                                style={"width": "100px"}, debounce=True),
+                    ], id="join-row-count-input-wrapper", style={"display": "none"}),
+                    html.Div([
+                        dcc.Checklist(
+                            id="join-hide-tall-trees-toggle",
+                            options=[{"label": " Hide unmeasured trees (height ≥ 999)", "value": "hide"}],
+                            value=[],
+                            inline=True,
+                            style={"fontWeight": "bold", "display": "inline-block"}
+                        ),
+                    ], style={"marginTop": "6px"}),
                 ], id="join-row-count-container", style={"display": "none", "marginBottom": "15px"}),
                 
                 # Error message div
                 html.Div([
                     html.Div([
                         html.Strong("⚠️ Please select at least one data source", style={"color": "#dc3545"}),
-                        html.P("You need to select at least one column from either Maternal Tree Data or Garden Climate Data to proceed.", 
+                        html.P("Select at least one variable from the garden dataset or maternal tree climate sections to proceed.", 
                                style={"color": "#666", "marginTop": "5px", "marginBottom": "0", "fontSize": "0.9em"})
                     ])
                 ], id="join-tab-execute-error", style={"display": "none", "textAlign": "center", "marginTop": "20px",
@@ -192,14 +359,267 @@ joins_layout = dcc.Tab(
                         html.Span(id='join-filter-count-text', style={"marginRight": "20px", "fontWeight": "bold"}),
                         html.Span(id='join-selected-count-text', style={"fontWeight": "bold", "marginRight": "12px"}),
                     ], style={"marginBottom": "8px"}),
+
+                    html.Div([
+                        html.H5("Calculated Column", style={"marginBottom": "8px", "color": "#133817"}),
+                        html.P(
+                            "Temporary columns are added to this preview, included in filtered CSV downloads, and available for analysis. They are not saved to the database.",
+                            style={"color": "#666", "fontSize": "0.9em", "marginBottom": "10px"},
+                        ),
+                        html.Div([
+                            dcc.Dropdown(id="calculated-column-left", placeholder="First variable", style={"flex": "1 1 0", "minWidth": "180px"}),
+                            html.Div([
+                                dcc.Dropdown(id="calculated-column-right", placeholder="Second variable", style={"width": "100%"}),
+                            ], id="calculated-column-right-wrapper", style={"flex": "1 1 0", "minWidth": "180px"}),
+                            html.Div([
+                                dcc.Dropdown(
+                                    id="calculated-column-operation",
+                                    options=CALCULATED_COLUMN_OPERATIONS,
+                                    value="add",
+                                    clearable=False,
+                                    style={"width": "100%"},
+                                ),
+                            ], style={"flex": "1 1 0", "minWidth": "180px"}),
+                        ], style={"display": "flex", "gap": "10px", "alignItems": "center"}),
+                        html.Div([
+                            dcc.Input(
+                                id="calculated-column-name",
+                                type="text",
+                                placeholder="New column name",
+                                style={"flex": "1 1 240px", "padding": "7px 10px", "border": "1px solid #ccc", "borderRadius": "4px"},
+                            ),
+                            html.Button(
+                                "Add Column",
+                                id="add-calculated-column-button",
+                                n_clicks=0,
+                                style={
+                                    "backgroundColor": "#007bff",
+                                    "color": "white",
+                                    "border": "none",
+                                    "borderRadius": "4px",
+                                    "padding": "7px 14px",
+                                    "fontSize": "14px",
+                                    "cursor": "pointer",
+                                    "whiteSpace": "nowrap",
+                                },
+                            ),
+                        ], style={"display": "flex", "flexWrap": "wrap", "gap": "10px", "alignItems": "center", "marginTop": "10px"}),
+                        html.Div([
+                            dcc.Dropdown(
+                                id="remove-calculated-column-dropdown",
+                                options=[],
+                                placeholder="Calculated column to remove",
+                                style={"flex": "1 1 260px"},
+                            ),
+                            html.Button(
+                                "Remove Column",
+                                id="remove-calculated-column-button",
+                                n_clicks=0,
+                                style={
+                                    "backgroundColor": "#6c757d",
+                                    "color": "white",
+                                    "border": "none",
+                                    "borderRadius": "4px",
+                                    "padding": "7px 14px",
+                                    "fontSize": "14px",
+                                    "cursor": "pointer",
+                                },
+                            ),
+                        ], style={"display": "flex", "flexWrap": "wrap", "gap": "10px", "alignItems": "center", "marginTop": "10px"}),
+                        html.Div(id="calculated-column-status", style={"marginTop": "8px", "fontSize": "0.9em"}),
+                    ], id="calculated-column-panel", style={"marginBottom": "15px", "padding": "12px", "backgroundColor": "#f8fbf9", "border": "1px solid #d8e7dc", "borderRadius": "8px"}),
                     
-                    # Loading indicator - wraps placeholder that gets replaced with grid
-                    dcc.Loading(
-                        id="join-grid-loading",
-                        type="default",
-                        children=html.Div(id="join-grid-wrapper", style={"maxHeight": "600px", "overflowY": "auto", "backgroundColor": "#e5ecf6", 
-                                 "padding": "10px", "borderRadius": "5px", "border": "1px solid #d1d1d1", "marginBottom": "15px"})
-                    ),
+                    # Stacked layout: Table on top, Stats & Figures below
+                    html.Div([
+                        # Table (Full Width)
+                        html.Div([
+                            dcc.Loading(
+                                id="join-grid-loading",
+                                type="default",
+                                children=html.Div(id="join-grid-wrapper", style={"backgroundColor": "#e5ecf6", 
+                                         "padding": "10px", "borderRadius": "5px", "border": "1px solid #d1d1d1", "marginBottom": "15px"}, children=[
+                                    AgGrid(
+                                        id='join-tab-grid',
+                                        rowData=[],
+                                        columnDefs=[],
+                                        defaultColDef={'filter': True, 'sortable': True, 'resizable': True},
+                                        dashGridOptions={'rowSelection': 'multiple', 'rowMultiSelectWithClick': True},
+                                        selectedRows=[],
+                                        className='ag-theme-alpine',
+                                        style={'width': '100%', 'height': '1px', 'display': 'none'},
+                                        enableEnterpriseModules=False,
+                                    )
+                                ])
+                            ),
+                        ], style={"width": "100%", "minWidth": "0"}),
+                        
+                        # Right: Stats & Figures
+                        html.Div([
+                            html.Div([
+                                html.H4("Optional Statistics & Figures", style={"marginBottom": "15px", "fontSize": "1.1em"}),
+                                html.P(
+                                    "Run lightweight summaries and figures on filtered results.",
+                                    style={"color": "#666", "marginBottom": "10px", "fontSize": "0.9em"},
+                                ),
+
+                                # Test selection
+                                html.Div([
+                                    html.Label("1) Select analysis type", style={"fontWeight": "bold", "marginBottom": "5px", "fontSize": "14px"}),
+                                    dcc.Dropdown(stat_test_options, id="stats-test-dropdown", placeholder="Statistical Test Options"),
+                                ], id="test-selection-div", style={"display": "block"}),
+                                
+                                # Containers for each test type
+                                html.Div([
+                                    # Linear Regression
+                                    html.Div([
+                                        html.Label("2) Select variables for Linear Regression", style={"fontWeight": "bold", "marginTop": "15px", "marginBottom": "5px"}),
+                                        html.Div([
+                                            html.Label("X-axis:", style={"marginRight": "10px"}),
+                                            dcc.Dropdown(id="lr-x-variable", placeholder="Select x Variable"),
+                                        ], style={"marginBottom": "10px"}),
+                                        html.Div([
+                                            html.Label("Y-axis:", style={"marginRight": "10px"}),
+                                            dcc.Dropdown(id="lr-y-variable", placeholder="Select y Variable"),
+                                        ], style={"marginBottom": "10px"}),
+                                        html.Div([
+                                            html.Label("Color by (optional):", style={"marginRight": "10px"}),
+                                            dcc.Dropdown(id="lr-color-variable", placeholder="Select color variable"),
+                                        ], style={"marginBottom": "10px"}),
+                                        html.Button("Generate Regression", id="run-lr-button", n_clicks=0,
+                                                   style={
+                                                       "backgroundColor": "#007bff",
+                                                       "color": "white",
+                                                       "border": "none",
+                                                       "borderRadius": "4px",
+                                                       "padding": "5px 15px",
+                                                       "marginTop": "10px"
+                                                   }),
+                                        html.Div(id="lr-output", style={"marginTop": "20px"}, children=[
+                                            dcc.Loading(id="lr-loading", type="default", children=html.Div(id="lr-output-content"))
+                                        ])
+                                    ], id="linear-regression-div", style={"display": "none"}),
+                                    
+                                    # PCA
+                                    html.Div([
+                                        html.Label("2) Select variables for PCA", style={"fontWeight": "bold", "marginTop": "15px", "marginBottom": "5px"}),
+                                        html.Div([
+                                            html.Label("Select numeric columns (minimum 2):", style={"marginRight": "10px"}),
+                                            dcc.Dropdown(id="pca-variables", placeholder="Variables", multi=True),
+                                        ], style={"marginBottom": "10px"}),
+                                        html.Div([
+                                            html.Label("Visualization:", style={"marginRight": "10px"}),
+                                            dcc.RadioItems(
+                                                id='pca-dimensions',
+                                                options=[
+                                                    {'label': '2D ', 'value': '2d'},
+                                                    {'label': '3D ', 'value': '3d'}
+                                                ],
+                                                value='2d',
+                                                inline=True,
+                                                style={"marginBottom": "10px"}
+                                            ),
+                                        ]),
+                                        html.Div([
+                                            html.Label("Color by (optional):", style={"marginRight": "10px"}),
+                                            dcc.Dropdown(id="pca-color-variable", placeholder="Select color variable"),
+                                        ], style={"marginBottom": "10px"}),
+                                        html.Button("Generate PCA", id="run-pca-button", n_clicks=0,
+                                                   style={
+                                                       "backgroundColor": "#007bff",
+                                                       "color": "white",
+                                                       "border": "none",
+                                                       "borderRadius": "4px",
+                                                       "padding": "5px 15px",
+                                                       "marginTop": "10px"
+                                                   }),
+                                        html.Div(id="pca-warning", style={"marginTop": "10px"}),
+                                        html.Div(id="pca-output", style={"marginTop": "20px"}, children=[
+                                            dcc.Loading(id="pca-loading", type="default", children=html.Div(id="pca-output-content"))
+                                        ])
+                                    ], id="pca-div", style={"display": "none"}),
+                                    
+                                    # Plot Data (No Test)
+                                    html.Div([
+                                        html.Label("2) Select variables for Plot", style={"fontWeight": "bold", "marginTop": "15px", "marginBottom": "5px"}),
+                                        html.Div([
+                                            html.Label("X-axis:", style={"marginRight": "10px"}),
+                                            dcc.Dropdown(id="pd-x-variable", placeholder="Select x Variable"),
+                                        ], style={"marginBottom": "10px"}),
+                                        html.Div([
+                                            html.Label("Y-axis:", style={"marginRight": "10px"}),
+                                            dcc.Dropdown(id="pd-y-variable", placeholder="Select y Variable"),
+                                        ], style={"marginBottom": "10px"}),
+                                        html.Div([
+                                            html.Label("Color by (optional):", style={"marginRight": "10px"}),
+                                            dcc.Dropdown(id="pd-color-variable", placeholder="Select color variable"),
+                                        ], style={"marginBottom": "10px"}),
+                                        html.Button("Generate Figure", id="run-pd-button", n_clicks=0,
+                                                   style={
+                                                       "backgroundColor": "#007bff",
+                                                       "color": "white",
+                                                       "border": "none",
+                                                       "borderRadius": "4px",
+                                                       "padding": "5px 15px",
+                                                       "marginTop": "10px"
+                                                   }),
+                                        
+                                        # Graph type selector (appears conditionally for CatxCat)
+                                        html.Div([
+                                            html.Div([
+                                                html.Span("Switch view:", style={"fontWeight": "500", "marginRight": "15px", "color": "#333"}),
+                                                dcc.RadioItems(
+                                                    id='cat-cat-graph-type',
+                                                    options=[
+                                                        {'label': ' 📊 Bar Chart', 'value': 'bar'},
+                                                        {'label': ' 🔥 Heatmap', 'value': 'heatmap'}
+                                                    ],
+                                                    value='bar',
+                                                    inline=True,
+                                                    labelStyle={"marginRight": "20px", "cursor": "pointer"},
+                                                    inputStyle={"marginRight": "5px"}
+                                                ),
+                                            ], style={
+                                                "display": "flex", 
+                                                "alignItems": "center", 
+                                                "justifyContent": "center",
+                                                "padding": "12px 20px",
+                                                "backgroundColor": "#f8f9fa",
+                                                "borderRadius": "8px",
+                                                "border": "1px solid #dee2e6",
+                                                "marginTop": "15px"
+                                            }),
+                                        ], id="graph-type-selector", style={"display": "none"}),
+                                        
+                                        html.Div(id="pd-output", style={"marginTop": "20px"}, children=[
+                                            dcc.Loading(id="pd-loading", type="default", children=html.Div(id="pd-output-content"))
+                                        ])
+                                    ], id="plot-data-div", style={"display": "none"}),
+                                    
+                                    # Summary Statistics
+                                    html.Div([
+                                        html.Label("2) Select Variable for Summary Statistics", style={"fontWeight": "bold", "marginTop": "15px", "marginBottom": "5px"}),
+                                        html.Div([
+                                            dcc.Dropdown(id="summary-variable", placeholder="Variables"),
+                                        ], style={"marginBottom": "10px"}),
+                                        html.Button("Generate Summary", id="run-summary-button", n_clicks=0,
+                                                   style={
+                                                       "backgroundColor": "#007bff",
+                                                       "color": "white",
+                                                       "border": "none",
+                                                       "borderRadius": "4px",
+                                                       "padding": "5px 15px",
+                                                       "marginTop": "10px"
+                                                   }),
+                                        html.Div(id="summary-output", style={"marginTop": "20px"}, children=[
+                                            dcc.Loading(id="summary-loading", type="default", children=html.Div(id="summary-output-content"))
+                                        ])
+                                    ], id="summary-stats-div", style={"display": "none"}),
+                                    
+                                ], id="test-container", style={"display": "none"}),
+                                
+                            ], id="stats-main-container", style={"display": "none", "padding": "15px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}),
+                        ], style={"width": "100%"}),
+                    ], style={"display": "flex", "flexDirection": "column", "gap": "20px"}),
                     
                     # Stats and download section
                     html.Div([
@@ -262,9 +682,10 @@ joins_layout = dcc.Tab(
                         dcc.Download(id="download-join-tab-csv"),
                         dcc.Download(id="download-join-tab-all-csv")
                     ])
-                ])
-            ]
-        )
+                ]),
+
+            ]) # END RIGHT COLUMN
+        ]) # END ROW
     ]
 ) 
 
@@ -279,12 +700,38 @@ def validate_table_name(table_name, allowed_set):
     return table_name
 
 def apply_filter_model(df, filter_model):
-    """Apply AG Grid filter model to a DataFrame"""
+    """Apply AG Grid filter model to a DataFrame.
+
+    The numeric branch is checked *first* (via filterType == 'number') so that
+    inequality filters such as >= 300 are never misrouted through the text
+    equality path — even when the column dtype is object after JSON
+    round-tripping.
+    """
     for field, model in (filter_model or {}).items():
         if field not in df.columns:
             continue
-        # Text filter
-        if model.get('filterType') == 'text' or isinstance(df[field].dtype, object):
+        # Numeric filter — check filterType first to avoid the dtype pitfall
+        if model.get('filterType') == 'number':
+            comp = model.get('type')
+            val = model.get('filter')
+            if val is None:
+                continue
+            val = float(val)
+            numeric_col = pd.to_numeric(df[field], errors='coerce')
+            if comp == 'lessThan':
+                df = df[numeric_col < val]
+            elif comp == 'lessThanOrEqual':
+                df = df[numeric_col <= val]
+            elif comp == 'greaterThan':
+                df = df[numeric_col > val]
+            elif comp == 'greaterThanOrEqual':
+                df = df[numeric_col >= val]
+            elif comp == 'equals':
+                df = df[numeric_col == val]
+            elif comp == 'notEqual':
+                df = df[numeric_col != val]
+        else:
+            # Text / default filter
             fval = str(model.get('filter', ''))
             ftype = model.get('type', 'contains')
             if ftype == 'contains':
@@ -298,27 +745,7 @@ def apply_filter_model(df, filter_model):
             elif ftype == 'endsWith':
                 df = df[df[field].astype(str).str.endswith(fval, na=False)]
             else:
-                # Default to contains
                 df = df[df[field].astype(str).str.contains(fval, na=False, case=False)]
-        else:
-            # Numeric filter
-            comp = model.get('type')
-            val = model.get('filter')
-            if val is None:
-                continue
-            val = float(val)
-            if comp == 'lessThan':
-                df = df[pd.to_numeric(df[field], errors='coerce') < val]
-            elif comp == 'lessThanOrEqual':
-                df = df[pd.to_numeric(df[field], errors='coerce') <= val]
-            elif comp == 'greaterThan':
-                df = df[pd.to_numeric(df[field], errors='coerce') > val]
-            elif comp == 'greaterThanOrEqual':
-                df = df[pd.to_numeric(df[field], errors='coerce') >= val]
-            elif comp == 'equals':
-                df = df[pd.to_numeric(df[field], errors='coerce') == val]
-            elif comp == 'notEqual':
-                df = df[pd.to_numeric(df[field], errors='coerce') != val]
     return df
 
 def get_column_lists_cached(metadata_store):
@@ -330,22 +757,16 @@ def get_column_lists_cached(metadata_store):
     
     # Fetch all column lists
     try:
-        # Gardens table
-        gardens_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM dbo.[{GARDENS_TABLE}]")
-        gardens_cols = gardens_df.columns.tolist() if gardens_df is not None else []
-        
         # Maternal tree table
-        tree_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM dbo.[{MATERNAL_TREE_TABLE}]")
+        tree_df = _fetch_for_user(f"SELECT TOP 1 * FROM dbo.[{MATERNAL_TREE_TABLE}]")
         tree_cols = tree_df.columns.tolist() if tree_df is not None else []
         
         return {
-            'gardens_columns': gardens_cols,
             'tree_columns': tree_cols
         }
     except Exception as e:
         print(f"Error fetching column lists: {e}")
         return {
-            'gardens_columns': [],
             'tree_columns': []
         }
 
@@ -368,11 +789,8 @@ def set_tab_active(tab_value):
      Output('join-core-table-options', 'value', allow_duplicate=True),
      Output('join-tree-table-options', 'options', allow_duplicate=True),
      Output('join-tree-table-options', 'value', allow_duplicate=True),
-     Output('join-garden-table-options', 'options', allow_duplicate=True),
-     Output('join-garden-table-options', 'value', allow_duplicate=True),
      Output('join-table-columns-container', 'style', allow_duplicate=True),
      Output('join-tree-table-columns-container', 'style', allow_duplicate=True),
-     Output('join-garden-table-columns-container', 'style', allow_duplicate=True),
      Output('join-tab-execute-button-div', 'style', allow_duplicate=True),
      Output('join-tab-execute-error', 'style', allow_duplicate=True),
      Output('join-tab-results-div', 'style', allow_duplicate=True),
@@ -384,18 +802,28 @@ def set_tab_active(tab_value):
      Output('join-tab-csv-filename', 'value', allow_duplicate=True),
      Output('join-row-count', 'value', allow_duplicate=True),
      Output('join-row-count-container', 'style', allow_duplicate=True),
-     Output('join-tab-general-error', 'children', allow_duplicate=True)],
+     Output('join-tab-general-error', 'children', allow_duplicate=True),
+     Output('join-year-filter', 'options', allow_duplicate=True),
+     Output('join-year-filter', 'value', allow_duplicate=True),
+     Output('join-site-filter', 'options', allow_duplicate=True),
+     Output('join-site-filter', 'value', allow_duplicate=True),
+     Output('join-prefilter-container', 'style', allow_duplicate=True),
+     Output('join-limit-rows-toggle', 'value', allow_duplicate=True),
+     Output('stats-main-container', 'style', allow_duplicate=True),
+     Output('stats-test-dropdown', 'value', allow_duplicate=True),
+     Output('test-container', 'style', allow_duplicate=True),
+     Output('lr-output-content', 'children', allow_duplicate=True),
+     Output('pca-output-content', 'children', allow_duplicate=True),
+     Output('summary-output-content', 'children', allow_duplicate=True),
+     Output('pd-output-content', 'children', allow_duplicate=True),
+     Output('lr-color-variable', 'value', allow_duplicate=True),
+     Output('pca-color-variable', 'value', allow_duplicate=True),
+     Output('join-right-placeholder', 'style', allow_duplicate=True)],
     [Input('joins-tab-active', 'data')],
     prevent_initial_call=True
 )
 def reset_tab_data(is_active):
-    if is_active:
-        raise PreventUpdate
-    # Reset all controls when leaving the tab
-    return (None, [], [], [], [], [], [], 
-            {"display": "none"}, {"display": "none"}, {"display": "none"}, 
-            {"display": "none"}, {"display": "none"}, {"display": "none"},
-            "", {"display": "none"}, "", None, html.Div(), "joined_data", 20, {"display": "none"}, "")
+    raise PreventUpdate
 
 # Cache metadata when tab becomes active
 @callback(
@@ -417,20 +845,22 @@ def cache_metadata_on_tab_active(is_active, metadata_store):
 @callback(
     [Output('join-core-table-options', 'value', allow_duplicate=True),
      Output('join-tree-table-options', 'value', allow_duplicate=True),
-     Output('join-garden-table-options', 'value', allow_duplicate=True),
      Output('join-tab-results-div', 'style', allow_duplicate=True),
      Output('join-tab-execute-error', 'style', allow_duplicate=True),
      Output('join-tab-preview-container', 'style', allow_duplicate=True),
      Output('join-row-count-container', 'style', allow_duplicate=True),
-     Output('join-tab-general-error', 'children', allow_duplicate=True)],
+     Output('join-tab-general-error', 'children', allow_duplicate=True),
+     Output('join-year-filter', 'value', allow_duplicate=True),
+     Output('join-site-filter', 'value', allow_duplicate=True),
+     Output('join-right-placeholder', 'style', allow_duplicate=True)],
     [Input('join-tab-core-dropdown', 'value')],
     prevent_initial_call=True
 )
 def reset_columns_on_table_change(selected_table):
     # Reset all column selections and hide results when core table changes
-    return [], [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, ""
+    return [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, "", [], [], {"display": "block", "height": "100%"}
 
-# Handle conditionally rendered variable checklist - AUTO-SELECT ALL BY DEFAULT
+# Handle conditionally rendered variable dropdown - DEFAULT TO DE-SELECTED
 @callback(
     [Output("join-core-table-options", "options"),
      Output("join-core-table-options", "value"),
@@ -438,19 +868,19 @@ def reset_columns_on_table_change(selected_table):
      Output("join-tree-table-options", "options"),
      Output("join-tree-table-options", "value"),
      Output("join-tree-table-columns-container", "style"),
-     Output("join-garden-table-options", "options"),
-     Output("join-garden-table-options", "value"),
-     Output("join-garden-table-columns-container", "style"),
      Output("join-tab-execute-button-div", "style"),
      Output("join-tab-preview-container", "style"),
      Output("join-row-count-container", "style"),
-     Output("join-tab-general-error", "children")],
+     Output("join-tab-general-error", "children"),
+     Output("join-year-filter", "options"),
+     Output("join-site-filter", "options"),
+     Output("join-prefilter-container", "style")],
     [Input("join-tab-core-dropdown", "value")],
     [State('joins-metadata-store', 'data')]
 )
 def update_core_table_columns(selected_table, metadata_store):
     if selected_table is None:
-        return [], [], {"display": "none"}, [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, ""
+        return [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, "", [], [], {"display": "none"}
 
     try:
         # Validate table name
@@ -463,102 +893,65 @@ def update_core_table_columns(selected_table, metadata_store):
             column_data = get_column_lists_cached(metadata_store)
         
         # Get columns from cache
-        gardens_cols = column_data.get('gardens_columns', [])
         tree_cols = column_data.get('tree_columns', [])
         
-        # Create options
-        GARDENS_TABLE_OPTIONS = [{'label': c, 'value': c} for c in gardens_cols]
-        gardens_default_values = gardens_cols  # Auto-select all
-        
-        MATERNAL_TREE_OPTIONS = [{'label': c, 'value': c} for c in tree_cols]
-        tree_default_values = tree_cols  # Auto-select all
+        # Create user-facing options without required join keys.
+        MATERNAL_TREE_OPTIONS = _hide_join_key_options(tree_cols, TREE_JOIN_KEYS)
 
         # Fetch core table columns (not cached since it depends on selection)
-        sample_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
-        if sample_df is None or sample_df.empty:
+        sample_df = _fetch_for_user(f"SELECT TOP 0 * FROM [dbo].[{selected_table}]")
+        if sample_df is None or not len(sample_df.columns):
             error_msg = "Error: Could not fetch columns from selected table"
-            return [], [], {"display": "none"}, [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg
+            return [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg, [], [], {"display": "none"}
         
         cols = sample_df.columns.tolist()
-        opts = [{'label': c, 'value': c} for c in cols]
-        core_default_values = cols  # Auto-select all
+        opts = _hide_join_key_options(cols, _required_core_cols(selected_table))
         
-        return (opts, core_default_values, {"display": "block", "marginBottom": "20px", 
-                                            "padding": "15px", "backgroundColor": "#ffffff", 
-                                            "borderRadius": "8px", "border": "1px solid #e0e0e0"}, 
-                MATERNAL_TREE_OPTIONS, tree_default_values, {"display": "block", "marginBottom": "20px",
-                                                              "padding": "15px", "backgroundColor": "#ffffff", 
-                                                              "borderRadius": "8px", "border": "1px solid #e0e0e0"}, 
-                GARDENS_TABLE_OPTIONS, gardens_default_values, {"display": "block", "marginBottom": "20px",
-                                                                  "padding": "15px", "backgroundColor": "#ffffff", 
-                                                                  "borderRadius": "8px", "border": "1px solid #e0e0e0"}, 
+        # Fetch available years and sites for pre-join filtering
+        year_options = []
+        site_options = []
+        show_prefilter = {"display": "none"}
+        
+        try:
+            if "Year" in cols:
+                years_df = _fetch_for_user(f"SELECT DISTINCT [Year] FROM [dbo].[{selected_table}] WHERE [Year] IS NOT NULL ORDER BY [Year]")
+                if years_df is not None and not years_df.empty:
+                    year_values = sorted(years_df['Year'].dropna().unique())
+                    year_options = [{"label": str(int(y)) if float(y) == int(y) else str(y), "value": y} for y in year_values]
+            
+            if "Site" in cols:
+                sites_df = _fetch_for_user(f"SELECT DISTINCT [Site] FROM [dbo].[{selected_table}] WHERE [Site] IS NOT NULL ORDER BY [Site]")
+                if sites_df is not None and not sites_df.empty:
+                    site_values = sorted(sites_df['Site'].dropna().unique())
+                    site_options = [{"label": str(s), "value": s} for s in site_values]
+            
+            if year_options or site_options:
+                show_prefilter = {"display": "block", "marginBottom": "25px", "padding": "15px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}
+        except Exception as e:
+            print(f"Warning: Could not fetch filter options: {e}")
+        
+        card_style = {"display": "block", "marginBottom": "20px", 
+                      "padding": "15px", "backgroundColor": "#ffffff", 
+                      "borderRadius": "8px", "border": "1px solid #e0e0e0"}
+        
+        return (opts, [], card_style, 
+                MATERNAL_TREE_OPTIONS, [], card_style, 
                 {"display": "block", "textAlign": "center", "marginTop": "20px", "marginBottom": "20px"},
                 {"display": "block", "marginBottom": "20px", "padding": "15px", "backgroundColor": "#ffffff", 
                  "borderRadius": "8px", "border": "1px solid #e0e0e0"},
                 {"display": "block", "marginBottom": "15px"},
-                "")
+                "",
+                year_options, site_options, show_prefilter)
     except ValueError as ve:
-        error_msg = f"Security Error: {str(ve)}"
-        print(error_msg)
-        return [], [], {"display": "none"}, [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg
+        logger.exception("Invalid core table selection in Select and Filter")
+        error_msg = "That table is not available in this workflow."
+        return [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg, [], [], {"display": "none"}
     except Exception as e:
-        error_msg = f"Error fetching columns: {str(e)}"
-        print(error_msg)
-        return [], [], {"display": "none"}, [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg
+        logger.exception("Unable to fetch Select and Filter columns")
+        error_msg = "Column choices are unavailable right now. Try another dataset or try again later."
+        return [], [], {"display": "none"}, [], [], {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, error_msg, [], [], {"display": "none"}
 
-# Handle Core table Select All and Deselect All buttons
-@callback(
-    Output('join-core-table-options', 'value', allow_duplicate=True),
-    [Input('join-select_all_btn', 'n_clicks'), 
-     Input('join-deselect_all_btn', 'n_clicks')],
-    [State('join-core-table-options', 'options')],
-    prevent_initial_call=True
-)
-def handle_core_select_buttons(select_all_clicks, deselect_all_clicks, current_options):
-    trigger_id = ctx.triggered_id if ctx.triggered_id else None
 
-    if trigger_id == 'join-select_all_btn' and current_options:
-        return [opt['value'] for opt in current_options]
-    if trigger_id == 'join-deselect_all_btn':
-        return []
-    
-    raise PreventUpdate
-
-# Handle Tree table Select All and Deselect All buttons
-@callback(
-    Output('join-tree-table-options', 'value', allow_duplicate=True),
-    [Input('join-select_all_btn-2', 'n_clicks'), 
-     Input('join-deselect_all_btn-2', 'n_clicks')],
-    [State('join-tree-table-options', 'options')],
-    prevent_initial_call=True
-)
-def handle_tree_select_buttons(select_all_clicks, deselect_all_clicks, current_options):
-    trigger_id = ctx.triggered_id if ctx.triggered_id else None
-
-    if trigger_id == 'join-select_all_btn-2' and current_options:
-        return [opt['value'] for opt in current_options]
-    if trigger_id == 'join-deselect_all_btn-2':
-        return []
-    
-    raise PreventUpdate
-
-# Handle Garden table Select All and Deselect All buttons
-@callback(
-    Output('join-garden-table-options', 'value', allow_duplicate=True),
-    [Input('join-select_all_btn-3', 'n_clicks'), 
-     Input('join-deselect_all_btn-3', 'n_clicks')],
-    [State('join-garden-table-options', 'options')],
-    prevent_initial_call=True
-)
-def handle_garden_select_buttons(select_all_clicks, deselect_all_clicks, current_options):
-    trigger_id = ctx.triggered_id if ctx.triggered_id else None
-
-    if trigger_id == 'join-select_all_btn-3' and current_options:
-        return [opt['value'] for opt in current_options]
-    if trigger_id == 'join-deselect_all_btn-3':
-        return []
-    
-    raise PreventUpdate
 
 # Update join preview based on selections
 @callback(
@@ -567,10 +960,11 @@ def handle_garden_select_buttons(select_all_clicks, deselect_all_clicks, current
     [Input("join-tab-core-dropdown", "value"),
      Input("join-core-table-options", "value"),
      Input("join-tree-table-options", "value"),
-     Input("join-garden-table-options", "value")],
+     Input("join-year-filter", "value"),
+     Input("join-site-filter", "value")],
     prevent_initial_call=True
 )
-def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
+def update_join_preview(core_table, core_vars, tree_vars, year_filter, site_filter):
     if not core_table:
         return "", {"display": "none"}
     
@@ -578,11 +972,34 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
     
     # Core table info
     core_name = CORE_TABLES.get(core_table, core_table)
-    core_count = len(core_vars) if core_vars else 0
+    if core_vars:
+        core_count = len(core_vars)
+        core_label = f"{core_count} columns selected"
+    elif not tree_vars:
+        core_count = None
+        core_label = "Full dataset view"
+    else:
+        core_count = 0
+        core_label = "0 columns selected"
     preview_parts.append(html.Div([
         html.Strong(f"{core_name}:"), 
-        html.Span(f" {core_count} columns selected", style={"marginLeft": "10px"})
+        html.Span(f" {core_label}", style={"marginLeft": "10px"})
     ], style={"marginBottom": "8px"}))
+    
+    # Pre-join filter info
+    if year_filter and len(year_filter) > 0:
+        year_str = ", ".join(str(int(y)) if float(y) == int(y) else str(y) for y in sorted(year_filter))
+        preview_parts.append(html.Div([
+            html.Strong("Year filter:"),
+            html.Span(f" {year_str}", style={"marginLeft": "10px", "color": "#007bff"})
+        ], style={"marginBottom": "8px"}))
+    
+    if site_filter and len(site_filter) > 0:
+        site_str = ", ".join(str(s) for s in sorted(site_filter))
+        preview_parts.append(html.Div([
+            html.Strong("Site filter:"),
+            html.Span(f" {site_str}", style={"marginLeft": "10px", "color": "#007bff"})
+        ], style={"marginBottom": "8px"}))
     
     # Maternal tree info
     if tree_vars:
@@ -594,23 +1011,9 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
             html.Span("(Matched by Accession + Locality)", style={"fontSize": "0.85em", "color": "#888", "marginLeft": "20px"})
         ], style={"marginBottom": "8px"}))
     
-    # Garden climate info
-    if garden_vars:
-        garden_count = len(garden_vars)
-        if core_table == "leaf_traits_2016":
-            match_info = "(Matched by Site)"
-        else:
-            match_info = "(Matched by Year + Site)"
+    if not core_vars and not tree_vars:
         preview_parts.append(html.Div([
-            html.Strong("Garden Climate:"), 
-            html.Span(f" {garden_count} columns selected", style={"marginLeft": "10px"}),
-            html.Br(),
-            html.Span(match_info, style={"fontSize": "0.85em", "color": "#888", "marginLeft": "20px"})
-        ], style={"marginBottom": "8px"}))
-    
-    if not tree_vars and not garden_vars:
-        preview_parts.append(html.Div([
-            html.Span("ERROR: Select at least one data source to combine", style={"color": "#ffc107", "fontStyle": "italic"})
+            html.Span("No join variables selected. The full dataset will be shown.", style={"color": "#856404", "fontStyle": "italic"})
         ]))
     
     return preview_parts, {"display": "block", "marginBottom": "20px", "padding": "15px", 
@@ -627,48 +1030,53 @@ def update_join_preview(core_table, core_vars, tree_vars, garden_vars):
         Output("join-tab-execute-button", "disabled"),
         Output("join-tab-general-error", "children", allow_duplicate=True),
         Output("join-row-count", "value"),
+        Output("join-right-placeholder", "style", allow_duplicate=True),
     ],
     [Input("join-tab-execute-button", "n_clicks")],
     [
         State("join-tab-core-dropdown", "value"),
         State("join-core-table-options", "value"),
         State("join-tree-table-options", "value"),
-        State("join-garden-table-options", "value"),
+        State("join-year-filter", "value"),
+        State("join-site-filter", "value"),
     ],
     prevent_initial_call=True,
 )
-def execute_join(n_clicks, core_table, core_table_vars, maternal_tree_vars, garden_climate_vars):
-    if not n_clicks or not core_table or (not maternal_tree_vars and not garden_climate_vars):
+def execute_join(n_clicks, core_table, core_table_vars, maternal_tree_vars, year_filter, site_filter):
+    if not n_clicks or not core_table:
         raise PreventUpdate
 
     try:
         # Validate table name
         validate_table_name(core_table, ALLOWED_CORE_TABLES)
         
-        # 1) Required core columns
-        if core_table == "leaf_traits_2016":
-            required_core_cols = ["Accession", "Locality", "Site"]
-            garden_key_cols = {"Site"}
-        else:
-            required_core_cols = ["Accession", "Locality", "Year", "Site"]
-            garden_key_cols = {"Year", "Site"}
-        tree_key_cols = {"Accession", "Locality"}
+        core_schema_df = _fetch_for_user(f"SELECT TOP 0 * FROM [dbo].[{core_table}]")
+        core_columns = core_schema_df.columns.tolist() if core_schema_df is not None else []
+
+        # 1) Required core columns. Join keys are hidden from dropdowns but
+        # always included in outputs when they exist on the selected core table.
+        required_core_cols = [c for c in _required_core_cols(core_table) if c in core_columns]
+        tree_key_cols = TREE_JOIN_KEYS
 
         # 2) Core SELECT
-        core_cols = required_core_cols[:]
         if core_table_vars:
+            core_cols = required_core_cols[:]
             core_cols += [c for c in core_table_vars if c not in core_cols]
+        elif not maternal_tree_vars:
+            core_cols = core_columns[:]
+        else:
+            core_cols = required_core_cols[:]
+        if not core_cols:
+            core_cols = core_columns[:] if core_columns else required_core_cols[:]
         core_sel = ", ".join(f"core.[{c}]" for c in core_cols)
         selected_clauses = [core_sel]
 
-        # 3) Clean out any key‐columns from the non‐core selections
-        safe_tree_vars   = [c for c in maternal_tree_vars   or [] if c not in tree_key_cols]
-        safe_garden_vars = [c for c in garden_climate_vars or [] if c not in garden_key_cols]
+        # 3) Clean out any key-columns from the non-core selections
+        safe_tree_vars = [c for c in maternal_tree_vars or [] if c not in tree_key_cols]
 
-        # 4) Maternal‐tree join
+        # 4) Maternal-tree join
         joins = []
         if maternal_tree_vars:
-            # only add non‐key columns to SELECT
             if safe_tree_vars:
                 tree_sel = ", ".join(
                     f"maternal.[{c}] AS [maternal_{c.replace(' ', '_')}]"
@@ -676,7 +1084,6 @@ def execute_join(n_clicks, core_table, core_table_vars, maternal_tree_vars, gard
                 )
                 selected_clauses.append(tree_sel)
 
-            # build a subquery that SELECTs keys + only the safe vars
             tree_cols = ["TRY_CAST(TRY_CAST([Accession] AS NUMERIC) AS INT) AS [Accession]",
                          "[Locality]"] \
                         + [f"[{c}]" for c in safe_tree_vars]
@@ -689,30 +1096,19 @@ LEFT JOIN (
  AND core.[Locality]  = maternal.[Locality]
 """.strip())
 
-        # 5) Garden‐climate join
-        if garden_climate_vars:
-            if safe_garden_vars:
-                garden_sel = ", ".join(
-                    f"garden.[{c}] AS [garden_{c.replace(' ', '_')}]"
-                    for c in safe_garden_vars
-                )
-                selected_clauses.append(garden_sel)
-
-            if core_table == "leaf_traits_2016":
-                garden_cols = ["[Site]"] + [f"[{c}]" for c in safe_garden_vars]
-                join_cond   = "core.[Site] = garden.[Site]"
-            else:
-                garden_cols = ["TRY_CAST(TRY_CAST([Year] AS NUMERIC) AS INT) AS [Year]",
-                               "[Site]"] + [f"[{c}]" for c in safe_garden_vars]
-                join_cond   = "core.[Year] = garden.[Year] AND core.[Site] = garden.[Site]"
-
-            joins.append(f"""
-LEFT JOIN (
-  SELECT {', '.join(garden_cols)}
-  FROM [dbo].[{GARDENS_TABLE}]
-) garden
-  ON {join_cond}
-""".strip())
+        # 5) Build WHERE clause for pre-join filters
+        where_clauses = []
+        if year_filter and len(year_filter) > 0 and "Year" in core_columns:
+            year_placeholders = ", ".join(str(int(y)) for y in year_filter)
+            where_clauses.append(f"core.[Year] IN ({year_placeholders})")
+        if site_filter and len(site_filter) > 0:
+            # Sanitize site values to prevent injection
+            safe_sites = ", ".join(f"'{str(s).replace(chr(39), chr(39)+chr(39))}'" for s in site_filter)
+            where_clauses.append(f"core.[Site] IN ({safe_sites})")
+        
+        where_sql = ""
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
 
         # 6) Assemble base query (without TOP clause)
         base_query = f"""
@@ -720,6 +1116,7 @@ SELECT DISTINCT
   {', '.join(selected_clauses)}
 FROM [dbo].[{core_table}] core
 {chr(10).join(joins)}
+{where_sql}
 """.strip()
         
         # Generate default filename based on core table name
@@ -729,16 +1126,27 @@ FROM [dbo].[{core_table}] core
         return (base_query, default_filename, 
                 {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, 
                 {"display": "block", "marginBottom": "15px"}, 
-                "Join Data & View Results", False, "", 20)
+                "Join Data & View Results", False, "", 100, {"display": "none"})
 
     except ValueError as ve:
-        error_msg = f"Security Error: {str(ve)}"
-        print("Security error:", error_msg)
-        return None, dash.no_update, {"display": "none"}, {"display": "none"}, "Join Data & View Results", False, error_msg, 20
+        logger.exception("Invalid join request")
+        error_msg = "That dataset selection is not available."
+        return None, dash.no_update, {"display": "none"}, {"display": "none"}, "Join Data & View Results", False, error_msg, 100, {"display": "block", "height": "100%"}
     except Exception as e:
-        error_msg = f"Error executing join: {str(e)}"
-        print("SQL Error:", error_msg)
-        return None, dash.no_update, {"display": "none"}, {"display": "none"}, "Join Data & View Results", False, error_msg, 20
+        logger.exception("Unable to execute Select and Filter join")
+        error_msg = "Results could not be prepared. Try fewer variables or narrower filters."
+        return None, dash.no_update, {"display": "none"}, {"display": "none"}, "Join Data & View Results", False, error_msg, 100, {"display": "block", "height": "100%"}
+
+# Toggle visibility of row count input
+@callback(
+    Output('join-row-count-input-wrapper', 'style'),
+    [Input('join-limit-rows-toggle', 'value')],
+    prevent_initial_call=True
+)
+def toggle_row_count_input(limit_toggle):
+    if limit_toggle and "limit" in limit_toggle:
+        return {"display": "flex", "alignItems": "center"}
+    return {"display": "none"}
 
 # Update the grid data based on row count (and determine total count from actual query)
 @callback(
@@ -750,24 +1158,31 @@ FROM [dbo].[{core_table}] core
      Output('download-join-tab-all-csv-button', 'children'),
      Output('join-download-warning', 'children'),
      Output('join-tab-results-div', 'style', allow_duplicate=True),
-     Output('join-row-count-container', 'style', allow_duplicate=True)],
+     Output('join-row-count-container', 'style', allow_duplicate=True),
+     Output('calculated-columns-store', 'data', allow_duplicate=True),
+     Output('remove-calculated-column-dropdown', 'options', allow_duplicate=True),
+     Output('remove-calculated-column-dropdown', 'value', allow_duplicate=True),
+     Output('calculated-column-status', 'children', allow_duplicate=True),
+     Output('join-right-placeholder', 'style', allow_duplicate=True)],
     [Input('join-tab-full-query', 'data'),
-     Input('join-row-count', 'value')],
+     Input('join-row-count', 'value'),
+     Input('join-limit-rows-toggle', 'value'),
+     Input('join-hide-tall-trees-toggle', 'value')],
     prevent_initial_call=True
 )
-
-def update_grid_display(base_query, row_count):
-    if not base_query or row_count is None:
+def update_grid_display(base_query, row_count, limit_toggle, hide_tall_toggle):
+    if not base_query:
         raise PreventUpdate
 
     try:
-        # Validate row count
-        if row_count < 1:
-            row_count = 20
-
-        # Execute a single query that returns BOTH the requested rows and the full result count
-        # COUNT(*) OVER() computes the total rows in the subquery without needing a second COUNT(*) query.
-        display_query = f"""
+        # Determine if we should limit rows
+        use_limit = limit_toggle and "limit" in limit_toggle and row_count and row_count > 0
+        
+        if use_limit:
+            if row_count < 1:
+                row_count = 100
+            # Execute with TOP limit
+            display_query = f"""
 SELECT TOP {row_count}
   q.*,
   COUNT(*) OVER() AS __total_count__
@@ -775,12 +1190,22 @@ FROM (
   {base_query}
 ) AS q
 """
+        else:
+            # Execute without limit - show all rows, but still get count
+            display_query = f"""
+SELECT
+  q.*,
+  COUNT(*) OVER() AS __total_count__
+FROM (
+  {base_query}
+) AS q
+"""
 
-        result_df = fetch_data_from_sql(display_query)
+        result_df = _fetch_for_user(display_query)
 
         if result_df is None or result_df.empty:
             empty_div = html.Div("No results returned", style={"padding": "20px", "textAlign": "center", "color": "#666"})
-            return empty_div, "No results returned", "", 1000000, dash.no_update, dash.no_update, html.Div(), {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, {"display": "block", "marginBottom": "15px"}
+            return empty_div, "No results returned", "", 1000000, dash.no_update, dash.no_update, html.Div(), {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, {"display": "block", "marginBottom": "15px"}, [], [], None, html.Div(), {"display": "none"}
 
         # Pull the total count and then drop the helper column so it doesn't show in the grid/downloads
         total_count = 0
@@ -790,6 +1215,15 @@ FROM (
             except Exception:
                 total_count = 0
             result_df = result_df.drop(columns=["__total_count__"], errors="ignore")
+
+        # Apply height >= 999 filter if toggle is checked
+        hide_tall = hide_tall_toggle and "hide" in hide_tall_toggle
+        if hide_tall:
+            # Find any column whose name contains "Height" (case-insensitive)
+            height_cols = [c for c in result_df.columns if "height" in c.lower()]
+            for hc in height_cols:
+                numeric_h = pd.to_numeric(result_df[hc], errors='coerce')
+                result_df = result_df[numeric_h.isna() | (numeric_h < 999)]
 
         actual_rows = len(result_df)
 
@@ -848,15 +1282,29 @@ FROM (
                     }
                 }
             else:
-                col_def = {
-                    'headerName': c,
-                    'field': c,
-                    'filter': 'agTextColumnFilter',
-                    'filterParams': {
-                        'filterOptions': ['contains','notContains','equals','notEqual','startsWith','endsWith'],
-                        'suppressAndOrCondition': True
+                # Use dropdown (set) filter for categorical/text columns
+                unique_vals = col_series.dropna().unique().tolist()
+                # If reasonable number of unique values, use set filter; otherwise text filter
+                if len(unique_vals) <= 200:
+                    col_def = {
+                        'headerName': c,
+                        'field': c,
+                        'filter': True,
+                        'filterParams': {
+                            'filterOptions': ['contains','notContains','equals','notEqual','startsWith','endsWith'],
+                            'suppressAndOrCondition': True
+                        }
                     }
-                }
+                else:
+                    col_def = {
+                        'headerName': c,
+                        'field': c,
+                        'filter': 'agTextColumnFilter',
+                        'filterParams': {
+                            'filterOptions': ['contains','notContains','equals','notEqual','startsWith','endsWith'],
+                            'suppressAndOrCondition': True
+                        }
+                    }
             
             column_defs.append(col_def)
         
@@ -879,7 +1327,7 @@ FROM (
                 style={'width': '100%', 'height': '500px'},
                 enableEnterpriseModules=False,
             ),
-            style={"overflowX": "auto", "width": "100%"}
+            style={"width": "100%"}
         )
         
         # Stats text - removed per user request
@@ -905,26 +1353,71 @@ FROM (
                 "marginBottom": "10px"
             })
 
-        return grid_component, stats_text, max_rows_text, max_val, filtered_btn_text, full_btn_text, download_warning, {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, {"display": "block", "marginBottom": "15px"}
+        return grid_component, stats_text, max_rows_text, max_val, filtered_btn_text, full_btn_text, download_warning, {"display": "block", "padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"}, {"display": "block", "marginBottom": "15px"}, [], [], None, html.Div(), {"display": "none"}
 
     except Exception as e:
-        error_msg = f"Error updating grid display: {str(e)}"
-        print(error_msg)
-        error_div = html.Div(error_msg, style={"padding": "20px", "color": "red"})
-        return error_div, "", "", 1000000, dash.no_update, dash.no_update, html.Div(), {"display": "none"}, {"display": "none"}
+        logger.exception("Unable to update Select and Filter grid")
+        error_msg = "Results are unavailable right now. Try a smaller preview or adjust your filters."
+        error_div = html.Div(error_msg, className="status-warning")
+        return error_div, "", "", 1000000, dash.no_update, dash.no_update, html.Div(), {"display": "none"}, {"display": "none"}, [], [], None, html.Div(), {"display": "block", "height": "100%"}
 
 # Reset results when any selection changes
 @callback(
     [Output("join-tab-results-div", "style", allow_duplicate=True),
-     Output("join-row-count-container", "style", allow_duplicate=True)],
+     Output("join-row-count-container", "style", allow_duplicate=True),
+     Output("join-tab-full-query", "data", allow_duplicate=True),
+     Output("join-grid-wrapper", "children", allow_duplicate=True),
+     Output("join-tab-results-stats", "children", allow_duplicate=True),
+     Output("join-filter-count-text", "children", allow_duplicate=True),
+     Output("join-selected-count-text", "children", allow_duplicate=True),
+     Output("join-download-warning", "children", allow_duplicate=True),
+     Output("stats-main-container", "style", allow_duplicate=True),
+     Output("stats-test-dropdown", "value", allow_duplicate=True),
+     Output("test-container", "style", allow_duplicate=True),
+     Output("lr-output-content", "children", allow_duplicate=True),
+     Output("pca-output-content", "children", allow_duplicate=True),
+     Output("summary-output-content", "children", allow_duplicate=True),
+     Output("pd-output-content", "children", allow_duplicate=True),
+     Output("calculated-column-status", "children", allow_duplicate=True),
+     Output("calculated-columns-store", "data", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "options", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "value", allow_duplicate=True),
+     Output("lr-color-variable", "value", allow_duplicate=True),
+     Output("pca-color-variable", "value", allow_duplicate=True),
+     Output("join-right-placeholder", "style", allow_duplicate=True)],
     [Input("join-core-table-options", "value"),
      Input("join-tree-table-options", "value"),
-     Input("join-garden-table-options", "value")],
+     Input("join-year-filter", "value"),
+     Input("join-site-filter", "value")],
     prevent_initial_call=True
 )
-def reset_results_on_selection_change(core_vars, tree_vars, garden_vars):
-    # Hide results whenever selections change
-    return {"display": "none"}, {"display": "none"}
+def reset_results_on_selection_change(core_vars, tree_vars, year_filter, site_filter):
+    # Hide and clear stale generated outputs whenever selected inputs change.
+    empty = html.Div()
+    return (
+        {"display": "none"},
+        {"display": "none"},
+        None,
+        empty,
+        "",
+        "",
+        "",
+        empty,
+        {"display": "none"},
+        None,
+        {"display": "none"},
+        empty,
+        empty,
+        empty,
+        empty,
+        empty,
+        [],
+        [],
+        None,
+        None,
+        None,
+        {"display": "block", "height": "100%"},
+    )
 
 # Update filter and selection counts for AG Grid
 @callback(
@@ -1042,7 +1535,7 @@ def download_all_join_results(n_clicks, base_query, custom_filename):
     
     try:
         # Fetch all data from database using the stored query
-        df = fetch_data_from_sql(base_query)
+        df = _fetch_for_user(base_query)
         
         if df is None or df.empty:
             raise PreventUpdate
@@ -1066,18 +1559,648 @@ def download_all_join_results(n_clicks, base_query, custom_filename):
     Output("join-tab-execute-error", "style"),
     [Input("join-tab-execute-button", "n_clicks")],
     [State("join-core-table-options", "value"),
-     State("join-tree-table-options", "value"),
-     State("join-garden-table-options", "value")],
+     State("join-tree-table-options", "value")],
     prevent_initial_call=True
 )
-def show_error_message(n_clicks, core_table_vars, maternal_tree_vars, garden_climate_vars):
+def show_error_message(n_clicks, core_table_vars, maternal_tree_vars):
     if n_clicks is None or n_clicks == 0:
         raise PreventUpdate
     
-    # Show error message if no maternal tree or garden climate variables are selected
-    if not maternal_tree_vars and not garden_climate_vars:
-        return {"display": "block", "textAlign": "center", "marginTop": "20px",
-                "padding": "15px", "backgroundColor": "#fff3cd", 
-                "borderRadius": "8px", "border": "1px solid #ffc107"}
-    
+    # Show error message if no variables are selected anywhere.
     return {"display": "none"}
+
+# ====== STATISTICAL CALLBACKS ======
+
+@callback(
+    [Output("stats-main-container", "style", allow_duplicate=True),
+     Output("lr-x-variable", "options"),
+     Output("lr-y-variable", "options"),
+     Output("pca-variables", "options"),
+     Output("summary-variable", "options"),
+     Output("pd-x-variable", "options"),
+     Output("pd-y-variable", "options"),
+     Output("pd-color-variable", "options"),
+     Output("calculated-column-left", "options"),
+     Output("calculated-column-right", "options"),
+     Output("lr-color-variable", "options"),
+     Output("pca-color-variable", "options"),
+     Output("stats-test-dropdown", "value"),
+     Output("lr-x-variable", "value"),
+     Output("lr-y-variable", "value"),
+     Output("pca-variables", "value"),
+     Output("summary-variable", "value"),
+     Output("pd-x-variable", "value"),
+     Output("pd-y-variable", "value"),
+     Output("pd-color-variable", "value"),
+     Output("calculated-column-left", "value"),
+     Output("calculated-column-right", "value"),
+     Output("lr-color-variable", "value"),
+     Output("pca-color-variable", "value"),
+     Output("calculated-column-name", "value"),
+     Output("calculated-column-status", "children", allow_duplicate=True),
+     Output("lr-output-content", "children", allow_duplicate=True),
+     Output("pca-output-content", "children", allow_duplicate=True),
+     Output("summary-output-content", "children", allow_duplicate=True),
+     Output("pd-output-content", "children", allow_duplicate=True)],
+    [Input('join-tab-grid', 'rowData')],
+    prevent_initial_call=True
+)
+def populate_stats_options(row_data):
+    # This runs when grid row data is first loaded/updated. Let's provide options based on numeric columns in row_data.
+    if not row_data:
+        empty = html.Div()
+        return {"display": "none"}, [], [], [], [], [], [], [], [], [], [], [], None, None, None, None, None, None, None, None, None, None, None, None, "", empty, empty, empty, empty, empty
+    
+    df = pd.DataFrame(row_data)
+    numeric_cols = []
+    
+    all_options = []
+    for c in df.columns:
+        if c == '__select__':
+            continue
+        col_series = df[c]
+        all_options.append(_analysis_option(c, col_series))
+        try:
+            if _is_numeric_like(col_series):
+                numeric_cols.append(c)
+        except Exception:
+            pass
+            
+    numeric_options = [_analysis_option(col, df[col]) for col in numeric_cols]
+    
+    # We also clear out previous results and selections to easily support new joins
+    return (
+        {"display": "block", "padding": "15px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"},
+        numeric_options, numeric_options, numeric_options, numeric_options, all_options, all_options,
+        all_options,
+        numeric_options, numeric_options,
+        all_options, all_options,
+        None, None, None, None, None, None, None, None, None, None, None, None, "", html.Div(),
+        html.Div(), html.Div(), html.Div(), html.Div()
+    )
+
+
+@callback(
+    Output("calculated-column-right-wrapper", "style"),
+    [Input("calculated-column-operation", "value")],
+    prevent_initial_call=False
+)
+def toggle_calculated_column_second_variable(operation):
+    if operation == "center":
+        return {"display": "none"}
+    return {"display": "block", "flex": "1 1 0", "minWidth": "180px"}
+
+
+@callback(
+    [Output("join-tab-grid", "rowData"),
+     Output("join-tab-grid", "columnDefs"),
+     Output("calculated-columns-store", "data", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "options", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "value", allow_duplicate=True),
+     Output("calculated-column-status", "children", allow_duplicate=True)],
+    [Input("add-calculated-column-button", "n_clicks")],
+    [State("join-tab-grid", "rowData"),
+     State("join-tab-grid", "columnDefs"),
+     State("calculated-column-name", "value"),
+     State("calculated-column-operation", "value"),
+     State("calculated-column-left", "value"),
+     State("calculated-column-right", "value"),
+     State("calculated-columns-store", "data")],
+    prevent_initial_call=True
+)
+def add_calculated_column(n_clicks, row_data, column_defs, new_name, operation, left_col, right_col, calculated_columns):
+    if not n_clicks:
+        raise PreventUpdate
+    if not row_data:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div("Run a dataset preview before adding a calculated column.", className="status-warning")
+
+    clean_name = _safe_calculated_column_name(new_name)
+    if not clean_name:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div("Enter a valid calculated column name.", className="status-warning")
+
+    df = pd.DataFrame(row_data)
+    if clean_name in df.columns:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div("Choose a column name that is not already in the table.", className="status-warning")
+
+    try:
+        df[clean_name] = _calculated_column_series(df, operation, left_col, right_col)
+    except ValueError as exc:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div(str(exc), className="status-warning")
+    except Exception:
+        logger.exception("Unable to add calculated column")
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div("The calculated column could not be created from those variables.", className="status-warning")
+
+    updated_defs = list(column_defs or [])
+    updated_defs.append({
+        "headerName": clean_name,
+        "field": clean_name,
+        "filter": "agNumberColumnFilter",
+        "filterParams": {
+            "filterOptions": ["equals", "notEqual", "lessThan", "lessThanOrEqual", "greaterThan", "greaterThanOrEqual"],
+            "suppressAndOrCondition": True,
+        },
+    })
+
+    updated_calculated_columns = list(calculated_columns or []) + [clean_name]
+    remove_options = _calculated_column_options(updated_calculated_columns)
+
+    return df.to_dict("records"), updated_defs, updated_calculated_columns, remove_options, None, html.Div(f"Added calculated column: {clean_name}", style={"color": "#155724"})
+
+
+@callback(
+    [Output("join-tab-grid", "rowData", allow_duplicate=True),
+     Output("join-tab-grid", "columnDefs", allow_duplicate=True),
+     Output("calculated-columns-store", "data", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "options", allow_duplicate=True),
+     Output("remove-calculated-column-dropdown", "value", allow_duplicate=True),
+     Output("calculated-column-status", "children", allow_duplicate=True)],
+    [Input("remove-calculated-column-button", "n_clicks")],
+    [State("join-tab-grid", "rowData"),
+     State("join-tab-grid", "columnDefs"),
+     State("remove-calculated-column-dropdown", "value"),
+     State("calculated-columns-store", "data")],
+    prevent_initial_call=True
+)
+def remove_calculated_column(n_clicks, row_data, column_defs, column_name, calculated_columns):
+    if not n_clicks:
+        raise PreventUpdate
+    if not column_name:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update, html.Div("Choose a calculated column to remove.", className="status-warning")
+    if column_name not in (calculated_columns or []):
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update, None, html.Div("That column is not tracked as a calculated column.", className="status-warning")
+
+    df = pd.DataFrame(row_data or [])
+    if column_name in df.columns:
+        df = df.drop(columns=[column_name])
+
+    updated_defs = _remove_column_def(column_defs, column_name)
+    updated_calculated_columns = [name for name in (calculated_columns or []) if name != column_name]
+    remove_options = _calculated_column_options(updated_calculated_columns)
+
+    return df.to_dict("records"), updated_defs, updated_calculated_columns, remove_options, None, html.Div(f"Removed calculated column: {column_name}", style={"color": "#155724"})
+
+
+@callback(
+    [Output("test-container", "style", allow_duplicate=True),
+     Output("linear-regression-div", "style"),
+     Output("pca-div", "style"),
+     Output("summary-stats-div", "style"),
+     Output("plot-data-div", "style"),
+     Output('lr-output-content', 'children', allow_duplicate=True),
+     Output('pca-output-content', 'children', allow_duplicate=True),
+     Output('summary-output-content', 'children', allow_duplicate=True),
+     Output('pd-output-content', 'children', allow_duplicate=True)],
+    [Input("stats-test-dropdown", "value")],
+    prevent_initial_call=True
+)
+def show_test_container(selected_test):
+    empty_output = html.Div()
+    if not selected_test:
+        return {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, {"display": "none"}, empty_output, empty_output, empty_output, empty_output
+    
+    lr_style = {"display": "block"} if selected_test == "linear_regression" else {"display": "none"}
+    pca_style = {"display": "block"} if selected_test == "pca" else {"display": "none"}
+    summary_style = {"display": "block"} if selected_test == "summary_stats" else {"display": "none"}
+    plot_data_style = {"display": "block"} if selected_test == "plot_data" else {"display": "none"}
+    
+    return {"display": "block"}, lr_style, pca_style, summary_style, plot_data_style, empty_output, empty_output, empty_output, empty_output
+
+
+@callback(
+    Output("pca-warning", "children", allow_duplicate=True),
+    [Input("pca-variables", "value")],
+    prevent_initial_call=True
+)
+def clear_pca_warning(variables):
+    return html.Div()
+
+# Analysis Helper
+def get_analysis_df(base_query, filter_model):
+    query = f"SELECT TOP 50000 * FROM ({base_query}) q"
+    df = _fetch_for_user(query)
+    if df is not None and not df.empty and filter_model:
+        df = apply_filter_model(df, filter_model)
+    return df
+
+
+def get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, required_columns=None):
+    required_columns = set(required_columns or [])
+    if row_data:
+        df = pd.DataFrame(row_data)
+        if not required_columns or required_columns.issubset(set(df.columns)):
+            if filter_model:
+                df = apply_filter_model(df, filter_model)
+            return df
+    return get_analysis_df(base_query, filter_model)
+
+@callback(
+    Output("lr-output-content", "children", allow_duplicate=True),
+    [Input("run-lr-button", "n_clicks")],
+    [State("join-tab-full-query", "data"),
+     State("join-tab-grid", "rowData"),
+     State("join-tab-grid", "filterModel"),
+     State("lr-x-variable", "value"),
+     State("lr-y-variable", "value"),
+     State("lr-color-variable", "value")],
+    prevent_initial_call=True
+)
+def run_linear_regression(n_clicks, base_query, row_data, filter_model, x_var, y_var, color_var):
+    if not base_query or not x_var or not y_var:
+        raise PreventUpdate
+        
+    cols_to_use = [x_var, y_var]
+    if color_var:
+        cols_to_use.append(color_var)
+    df = get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, cols_to_use)
+    df = df.dropna(subset=[x_var, y_var])
+    
+    # Needs numeric conversion just in case
+    df[x_var] = pd.to_numeric(df[x_var], errors='coerce')
+    df[y_var] = pd.to_numeric(df[y_var], errors='coerce')
+    df = df.dropna(subset=[x_var, y_var])
+    
+    if color_var and color_var in df.columns:
+        df = df.dropna(subset=[color_var])
+        
+    if df is None or df.empty or len(df) < MIN_ROWS_FOR_REGRESSION:
+        return html.Div([
+            html.H5("Insufficient Data", style={"color": "red"}),
+            html.P("Not enough valid data points for regression analysis.")
+        ], style={"color": "red", "fontWeight": "bold"})
+        
+    x = df[x_var].values
+    y = df[y_var].values
+    
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+    x_range = np.linspace(min(x), max(x), 100)
+    y_pred = slope * x_range + intercept
+    
+    if color_var and color_var in df.columns:
+        # Check if color variable is numeric or categorical
+        try:
+            df[color_var] = pd.to_numeric(df[color_var])
+        except Exception:
+            pass
+        fig = px.scatter(df, x=x_var, y=y_var, color=color_var, opacity=0.6)
+        fig.update_traces(marker=dict(size=8))
+    else:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=x, y=y, mode='markers', name='Data Points', marker=dict(color='blue', opacity=0.6, size=8)))
+        
+    fig.add_trace(go.Scatter(x=x_range, y=y_pred, mode='lines', name='Regression Line', line=dict(color='red', width=2)))
+    
+    r_squared = r_value**2
+    equation = f"y = {slope:.4f}x + {intercept:.4f}"
+    
+    fig.update_layout(
+        title=f"Linear Regression: {y_var} vs {x_var}", xaxis_title=x_var, yaxis_title=y_var,
+        height=500, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+        xaxis=dict(showgrid=True, gridcolor="#e0e0e0", gridwidth=1),
+        yaxis=dict(showgrid=True, gridcolor="#e0e0e0", gridwidth=1),
+        annotations=[
+            dict(x=0.02, y=0.98, xref="paper", yref="paper", text=f"Equation: {equation}<br>R² = {r_squared:.4f}<br>p-value = {p_value:.4f}",
+                 showarrow=False, bgcolor="rgba(255, 255, 255, 0.8)", bordercolor="rgba(0, 0, 0, 0.2)", borderwidth=1, borderpad=10, font=dict(size=12))
+        ]
+    )
+    
+    # We replace HTML table with plotly figure table (so they can download as image)
+    table_fig = go.Figure(data=[go.Table(
+        header=dict(values=['Metric', 'Value'], align='left', line_color='darkslategray', fill_color='lightskyblue'),
+        cells=dict(values=[
+            ['Slope', 'Intercept', 'R-squared', 'p-value', 'Standard Error', 'Sample Size'], 
+            [f"{slope:.6f}", f"{intercept:.6f}", f"{r_squared:.6f}", f"{p_value:.6f}", f"{std_err:.6f}", str(len(df))]
+        ], align='left', line_color='darkslategray', fill_color='white')
+    )])
+    
+    table_fig.update_layout(
+        title="Regression Statistics",
+        height=250, margin=dict(t=50, b=0, l=0, r=0), paper_bgcolor="#ffffff", plot_bgcolor="#ffffff"
+    )
+
+    return html.Div([
+        dcc.Graph(figure=fig),
+        dcc.Graph(figure=table_fig)
+    ], style={"padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"})
+
+
+@callback(
+    Output("pca-output-content", "children", allow_duplicate=True),
+    [Input("run-pca-button", "n_clicks")],
+    [State("join-tab-full-query", "data"),
+     State("join-tab-grid", "rowData"),
+     State("join-tab-grid", "filterModel"),
+     State("pca-variables", "value"),
+     State("pca-dimensions", "value"),
+     State("pca-color-variable", "value")], 
+    prevent_initial_call=True
+)
+def run_pca(n_clicks, base_query, row_data, filter_model, variables, dimensions, color_var):
+    if not base_query or not variables:
+        raise PreventUpdate
+        
+    cols_to_use = list(variables)
+    if color_var:
+        cols_to_use.append(color_var)
+        
+    df = get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, cols_to_use)
+    df = df.dropna(subset=variables)
+    
+    for v in variables:
+        df[v] = pd.to_numeric(df[v], errors='coerce')
+        
+    df = df.dropna(subset=variables)
+    
+    if color_var and color_var in df.columns:
+        df = df.dropna(subset=[color_var])
+    
+    if df is None or df.empty or len(df) < MIN_ROWS_FOR_PCA:
+        return html.Div([
+            html.H5("Insufficient Data", style={"color": "red"}),
+            html.P("Not enough valid data points for PCA analysis.")
+        ], style={"color": "red", "fontWeight": "bold"})
+        
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(df[variables])
+    
+    n_components = min(3, len(variables))
+    pca = PCA(n_components=n_components)
+    pca_result = pca.fit_transform(scaled_data)
+    
+    pca_df = pd.DataFrame(data=pca_result, columns=[f'PC{i+1}' for i in range(n_components)])
+    explained_variance = pca.explained_variance_ratio_ * 100
+    
+    if color_var and color_var in df.columns:
+        # Check if color variable is numeric or categorical
+        try:
+            df[color_var] = pd.to_numeric(df[color_var])
+        except Exception:
+            pass
+        pca_df[color_var] = df[color_var].values
+        
+    if dimensions == '3d' and n_components >= 3:
+        fig = px.scatter_3d(pca_df, x='PC1', y='PC2', z='PC3', title="3D PCA Visualization",
+            color=color_var if (color_var and color_var in pca_df.columns) else None,
+            labels={'PC1': f'PC1 ({explained_variance[0]:.2f}%)', 'PC2': f'PC2 ({explained_variance[1]:.2f}%)', 'PC3': f'PC3 ({explained_variance[2]:.2f}%)'}, opacity=0.7)
+    else:
+        fig = px.scatter(pca_df, x='PC1', y='PC2', title="2D PCA Visualization",
+            color=color_var if (color_var and color_var in pca_df.columns) else None,
+            labels={'PC1': f'PC1 ({explained_variance[0]:.2f}%)', 'PC2': f'PC2 ({explained_variance[1]:.2f}%)'}, opacity=0.7)
+            
+    fig.update_layout(height=600, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+                       xaxis=dict(showgrid=True, gridcolor="#e0e0e0", gridwidth=1),
+                       yaxis=dict(showgrid=True, gridcolor="#e0e0e0", gridwidth=1))
+    
+    loadings = pca.components_
+    loading_df = pd.DataFrame(loadings.T, columns=[f'PC{i+1}' for i in range(n_components)], index=variables)
+
+    # Explained Variance Table as Plotly Figure
+    ev_headers = ["Component", "Variance Explained (%)", "Cumulative Variance (%)"]
+    ev_components = [f"PC{i+1}" for i in range(n_components)]
+    ev_var = [f"{explained_variance[i]:.2f}%" for i in range(n_components)]
+    ev_cum = [f"{np.sum(explained_variance[:i+1]):.2f}%" for i in range(n_components)]
+    
+    ev_table_fig = go.Figure(data=[go.Table(
+        header=dict(values=ev_headers, align='left', line_color='darkslategray', fill_color='lightskyblue'),
+        cells=dict(values=[ev_components, ev_var, ev_cum], align='left', line_color='darkslategray', fill_color='white')
+    )])
+    ev_table_fig.update_layout(title="Explained Variance", height=200, margin=dict(t=50, b=0, l=0, r=0), paper_bgcolor="#ffffff", plot_bgcolor="#ffffff")
+
+    # Loadings Table as Plotly Figure
+    loadings_headers = ["Variable"] + [f"PC{i+1}" for i in range(n_components)]
+    loadings_values = [variables] + [[f"{loading_df.loc[var, f'PC{i+1}']:.4f}" for var in variables] for i in range(n_components)]
+    
+    load_table_fig = go.Figure(data=[go.Table(
+        header=dict(values=loadings_headers, align='left', line_color='darkslategray', fill_color='lightskyblue'),
+        cells=dict(values=loadings_values, align='left', line_color='darkslategray', fill_color='white')
+    )])
+    load_table_fig.update_layout(title="Variable Loadings", height=300, margin=dict(t=50, b=0, l=0, r=0), paper_bgcolor="#ffffff", plot_bgcolor="#ffffff")
+    
+    return html.Div([
+        dcc.Graph(figure=fig),
+        dcc.Graph(figure=ev_table_fig),
+        dcc.Graph(figure=load_table_fig)
+    ], style={"padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"})
+
+@callback(
+    Output("summary-output-content", "children", allow_duplicate=True),
+    [Input("run-summary-button", "n_clicks")],
+    [State("join-tab-full-query", "data"),
+     State("join-tab-grid", "rowData"),
+     State("join-tab-grid", "filterModel"),
+     State("summary-variable", "value")],
+    prevent_initial_call=True
+)
+def run_summary(n_clicks, base_query, row_data, filter_model, variable):
+    if not base_query or not variable:
+        raise PreventUpdate
+        
+    df = get_analysis_df_from_grid_or_query(base_query, row_data, filter_model, [variable])
+    
+    df[variable] = pd.to_numeric(df[variable], errors='coerce')
+    clean_data = df[variable].dropna()
+    
+    if len(clean_data) < 2:
+        return html.Div([
+            html.H5("Insufficient Data", style={"color": "red"}),
+            html.P("Not enough valid data points for summary statistics.")
+        ], style={"color": "red", "fontWeight": "bold"})
+        
+    mean = clean_data.mean()
+    median = clean_data.median()
+    std_dev = clean_data.std()
+    variance = clean_data.var()
+    minimum = clean_data.min()
+    maximum = clean_data.max()
+    q1 = clean_data.quantile(0.25)
+    q3 = clean_data.quantile(0.75)
+    skewness = stats.skew(clean_data)
+    kurtosis = stats.kurtosis(clean_data)
+    count = len(clean_data)
+    missing = len(df) - count
+    
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(x=clean_data, nbinsx=30, name='Histogram', marker_color='#007bff', opacity=0.7))
+    fig.add_vline(x=mean, line_dash="dash", line_color="red", annotation_text=f"Mean: {mean:.2f}", annotation_position="top right")
+    fig.add_vline(x=median, line_dash="dash", line_color="green", annotation_text=f"Median: {median:.2f}", annotation_position="top left")
+    
+    fig.update_layout(title=f"Distribution of {variable}", xaxis_title=variable, yaxis_title="Frequency", height=500, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+                       xaxis=dict(showgrid=True, gridcolor="#e0e0e0", gridwidth=1),
+                       yaxis=dict(showgrid=True, gridcolor="#e0e0e0", gridwidth=1))
+    
+    # Use Plotly Table for Summary Stats
+    sum_table_fig = go.Figure(data=[go.Table(
+        header=dict(values=['Statistic', 'Value'], align='left', line_color='darkslategray', fill_color='lightskyblue'),
+        cells=dict(values=[
+            ['Count', 'Missing Values', 'Mean', 'Median', 'Standard Deviation', 'Variance', 'Minimum', '25th Percentile (Q1)', '75th Percentile (Q3)', 'Maximum', 'Skewness', 'Kurtosis'],
+            [f"{count}", f"{missing}", f"{mean:.4f}", f"{median:.4f}", f"{std_dev:.4f}", f"{variance:.4f}", f"{minimum:.4f}", f"{q1:.4f}", f"{q3:.4f}", f"{maximum:.4f}", f"{skewness:.4f}", f"{kurtosis:.4f}"]
+        ], align='left', line_color='darkslategray', fill_color='white')
+    )])
+    sum_table_fig.update_layout(title="Summary Statistics", height=350, margin=dict(t=50, b=0, l=0, r=0), paper_bgcolor="#ffffff", plot_bgcolor="#ffffff")
+
+    # Add Box Plot
+    box_fig = go.Figure()
+    box_fig.add_trace(go.Box(x=clean_data, name=variable, marker_color='#28a745'))
+    box_fig.update_layout(title=f"Box Plot of {variable}", xaxis_title=variable, height=300, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+        xaxis=dict(showgrid=True, gridcolor="#e0e0e0", gridwidth=1),
+        yaxis=dict(showgrid=True, gridcolor="#e0e0e0", gridwidth=1))
+    
+    return html.Div([
+        dcc.Graph(figure=fig),
+        dcc.Graph(figure=box_fig),
+        dcc.Graph(figure=sum_table_fig)
+    ], style={"padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"})
+
+
+@callback(
+    [Output("pd-output-content", "children", allow_duplicate=True),
+     Output('graph-type-selector', 'style', allow_duplicate=True)],
+    [Input("run-pd-button", "n_clicks"),
+     Input('cat-cat-graph-type', 'value')],
+    [State('join-tab-full-query', 'data'),
+     State('join-tab-grid', 'rowData'),
+     State('join-tab-grid', 'selectedRows'),
+     State('join-tab-grid', 'filterModel'),
+     State('pd-x-variable', 'value'),
+     State('pd-y-variable', 'value'),
+     State('pd-color-variable', 'value')],
+    prevent_initial_call=True
+)
+def run_plot_data(n_clicks, graph_type, base_query, row_data, selected_rows, filter_model, x_var, y_var, color_var):
+    trigger_id = ctx.triggered_id if ctx.triggered_id else None
+    if trigger_id != 'run-pd-button' and trigger_id != 'cat-cat-graph-type':
+        raise PreventUpdate
+        
+    if not base_query or not x_var or not y_var:
+        raise PreventUpdate
+        
+    # Priority 1: Use user-selected rows if any
+    if selected_rows and len(selected_rows) > 0:
+        df = pd.DataFrame(selected_rows)
+    # Priority 2: Apply filter model to grid data if filters exist
+    elif row_data and filter_model:
+        df = pd.DataFrame(row_data)
+        df = apply_filter_model(df, filter_model)
+    # Priority 3: Use all grid data
+    elif row_data:
+        df = pd.DataFrame(row_data)
+    else:
+        df = get_analysis_df(base_query, filter_model)
+    
+    if df is None or df.empty:
+        return html.Div([
+            html.H5("Insufficient Data", style={"color": "red"}),
+            html.P("No valid data points for plotting.")
+        ], style={"color": "red", "fontWeight": "bold"}), {"display": "none"}
+
+    df = df.dropna(subset=[x_var, y_var])
+    
+    if len(df) == 0:
+        return html.Div([
+            html.H5("Insufficient Data", style={"color": "red"}),
+            html.P("No valid data points after dropping missing values.")
+        ], style={"color": "red", "fontWeight": "bold"}), {"display": "none"}
+        
+    x_is_numeric = False
+    y_is_numeric = False
+    
+    try:
+        df[x_var] = pd.to_numeric(df[x_var])
+        x_is_numeric = True
+    except: pass
+
+    try:
+        df[y_var] = pd.to_numeric(df[y_var])
+        y_is_numeric = True
+    except: pass
+    
+    # Validate color_var exists in df
+    if color_var and color_var not in df.columns:
+        color_var = None
+    
+    both_categorical = not x_is_numeric and not y_is_numeric
+    
+    if x_is_numeric and y_is_numeric:
+        fig = px.scatter(df, x=x_var, y=y_var, color=color_var if color_var else None,
+                         title=f"{x_var} vs {y_var}")
+    elif x_is_numeric or y_is_numeric:
+        numeric_var = x_var if x_is_numeric else y_var
+        categorical_var = y_var if x_is_numeric else x_var
+        df_agg = df.groupby(categorical_var)[numeric_var].mean().reset_index()
+        fig = px.bar(df_agg, x=categorical_var, y=numeric_var, title=f"Mean {numeric_var} by {categorical_var}")
+    else:
+        if graph_type == 'heatmap':
+            fig = px.density_heatmap(df, x=x_var, y=y_var, title=f"Heatmap of {x_var} vs {y_var}")
+        else:
+            fig = px.bar(df, x=x_var, color=y_var, barmode='group', title=f"{x_var} by {y_var}")
+            
+    fig.update_layout(height=500, paper_bgcolor="#ffffff", plot_bgcolor="#ffffff",
+                      xaxis=dict(showgrid=True, gridcolor="#e0e0e0", gridwidth=1),
+                      yaxis=dict(showgrid=True, gridcolor="#e0e0e0", gridwidth=1))
+    
+    toggle_style = {"display": "block"} if both_categorical else {"display": "none"}
+    
+    res = html.Div([
+        dcc.Graph(figure=fig)
+    ], style={"padding": "20px", "backgroundColor": "#ffffff", "borderRadius": "8px", "border": "1px solid #e0e0e0"})
+
+    return res, toggle_style
+
+# Drag and drop split-pane logic
+clientside_callback(
+    '''
+    function(id) {
+        var attachDrag = function() {
+            var divider = document.getElementById('join-drag-divider');
+            var leftPane = document.getElementById('join-left-pane');
+            var container = document.getElementById('join-split-container');
+            
+            if(!divider || !leftPane || !container) {
+                setTimeout(attachDrag, 500);
+                return;
+            }
+            
+            if(divider.dataset.listenerAttached === 'true') return;
+            divider.dataset.listenerAttached = 'true';
+            
+            var isResizing = false;
+            
+            divider.addEventListener('mousedown', function(e) {
+                isResizing = true;
+                document.body.style.cursor = 'col-resize';
+                document.body.style.userSelect = 'none'; // Prevent text selection
+                divider.style.backgroundColor = '#007bff';
+                e.preventDefault();
+            });
+            
+            document.addEventListener('mousemove', function(e) {
+                if (!isResizing) return;
+                var containerOffsetLeft = container.getBoundingClientRect().left;
+                var newWidth = e.clientX - containerOffsetLeft;
+                
+                var minW = container.getBoundingClientRect().width * 0.15;
+                var maxW = container.getBoundingClientRect().width * 0.85;
+                if(newWidth < minW) newWidth = minW;
+                if(newWidth > maxW) newWidth = maxW;
+                
+                leftPane.style.width = newWidth + 'px';
+                leftPane.style.flex = '0 0 auto';
+                e.preventDefault();
+            });
+            
+            document.addEventListener('mouseup', function(e) {
+                if (isResizing) {
+                    isResizing = false;
+                    document.body.style.cursor = '';
+                    document.body.style.userSelect = '';
+                    divider.style.backgroundColor = '#f4f4f4';
+                }
+            });
+        };
+        
+        attachDrag();
+        return window.dash_clientside.no_update;
+    }
+    ''',
+    Output('join-drag-divider', 'className'),
+    Input('join-drag-divider', 'id')
+)

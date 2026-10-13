@@ -1,15 +1,15 @@
-from dash import dcc, html, Dash
+from dash import dcc, html, Dash, callback, Input, Output, State
 from dash.dependencies import Input, Output
-from tabs.dataset import dataset_layout
-from tabs.stats import stats_layout
 from tabs.upload import upload_layout
 from tabs.download import download_layout
 from tabs.map import map_layout
 from tabs.joins import joins_layout
+from components.shell import build_app_bar, build_content_frame, build_footer, build_tabs
+import copy
 import os
 import secrets
 from dotenv import load_dotenv
-from flask import Flask, redirect, session, jsonify, request
+from flask import Flask, redirect, session
 from authlib.integrations.flask_client import OAuth
 from urllib.parse import parse_qs
 
@@ -74,7 +74,6 @@ def unauthorized():
 css = ["https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css"]
 app = Dash(name="Sork Lab Dashboard", server=server, external_stylesheets=css, suppress_callback_exceptions=True)
 
-# Font editting and coloring
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -84,24 +83,6 @@ app.index_string = '''
         <title>{%title%}</title>
         {%favicon%}
         {%css%}
-        <style>
-            body {
-                font-family: 'Gowun Batang', serif;
-                color: #133817;
-            }
-
-            h1, h2, h3, h4, h5, h6, p, div, span, a, button {
-                color: #133817 !important;
-            }
-
-            .btn, .btn-primary, .btn-outline-secondary {
-                color: #133817 !important;  
-            }
-
-            .text-muted {
-                color: #133817 !important;
-            }
-        </style>
     </head>
     <body>
         {%app_entry%}
@@ -114,118 +95,193 @@ app.index_string = '''
 </html>
 '''
 
+FLAT_FILE_SUBTAB_STYLE = {
+    "alignItems": "center",
+    "background": "rgba(255, 255, 255, 0.54)",
+    "border": "1px solid rgba(33, 79, 51, 0.12)",
+    "borderRadius": "6px",
+    "boxSizing": "border-box",
+    "color": "#214f33",
+    "cursor": "pointer",
+    "display": "inline-flex",
+    "fontWeight": "700",
+    "height": "38px",
+    "justifyContent": "center",
+    "lineHeight": "1.2",
+    "minWidth": "150px",
+    "maxWidth": "190px",
+    "padding": "0 18px",
+}
+
+FLAT_FILE_SUBTAB_SELECTED_STYLE = {
+    **FLAT_FILE_SUBTAB_STYLE,
+    "background": "#ffffff",
+    "border": "1px solid rgba(33, 79, 51, 0.32)",
+    "boxShadow": "0 6px 14px rgba(24, 47, 32, 0.08)",
+}
+
+# Create a combined flat-file tab with upload and download as sub-tabs
+flat_files_layout = dcc.Tab(
+    [
+        dcc.Tabs(
+            id="flat-files-subtabs",
+            value="download-subtab",
+            children=[
+                dcc.Tab(
+                    download_layout.children,
+                    label="Download/Browse",
+                    id="download-subtab",
+                    style=FLAT_FILE_SUBTAB_STYLE,
+                    selected_style=FLAT_FILE_SUBTAB_SELECTED_STYLE,
+                ),
+                dcc.Tab(
+                    upload_layout.children,
+                    label="Upload",
+                    id="upload-subtab",
+                    style=FLAT_FILE_SUBTAB_STYLE,
+                    selected_style=FLAT_FILE_SUBTAB_SELECTED_STYLE,
+                ),
+            ],
+            vertical=False,
+            mobile_breakpoint=0,
+            style={"display": "flex", "flexDirection": "row", "alignItems": "center", "justifyContent": "center", "gap": "10px", "width": "100%"},
+            parent_style={"display": "flex", "flex": "1 1 auto", "flexDirection": "column"},
+            className="flat-files-subtabs",
+            parent_className="flat-files-subtabs__parent",
+        )
+    ],
+    label="Flat File Downloads/Uploads",
+    id="flat-files-tab",
+    style={"padding": "15px", "display": "flex", "flexDirection": "column", "flex": "1 1 auto", "minHeight": 0}
+)
+
+TAB_SPECS = [
+    ("Select and Filter", joins_layout),
+    ("Tree Sites", map_layout),
+    ("Flat File Downloads/Uploads", flat_files_layout),
+]
+
+# Guest-facing tab set — Select & Filter and Map only (no uploads or flat-file downloads)
+GUEST_TAB_SPECS = [
+    ("Select and Filter", joins_layout),
+    ("Tree Sites", map_layout),
+]
+
+
+def build_user_actions():
+    return [
+        html.Div(
+            className="user-chip",
+            children=[
+                html.Div("SL", className="user-chip__avatar"),
+                html.Div(id='user-info', className="user-chip__text"),
+            ],
+        ),
+        html.A(
+            html.Button("Logout", className="btn btn-outline-secondary btn-sm logout-button"),
+            href="/logout",
+            className="logout-link",
+        ),
+    ]
+
+
+def build_authenticated_layout():
+    return html.Div(
+        className="app-shell",
+        children=[
+            dcc.Location(id='url', refresh=False),
+            build_app_bar("Dashboard", actions=build_user_actions()),
+            html.Main(
+                className="app-shell__body",
+                children=[
+                    build_content_frame(
+                        [
+                            html.Div(
+                                className="content-frame__header",
+                                children=[
+                                    html.Div(
+                                        [
+                                            html.P("Research Workspace", className="content-frame__eyebrow"),
+                                            html.H2("Shared data tools", className="content-frame__title"),
+                                            html.P(
+                                                "Browse tree sites, join datasets, upload data, and export curated slices from one shell.",
+                                                className="content-frame__subtitle",
+                                            ),
+                                        ]
+                                    )
+                                ],
+                            ),
+                            build_tabs(TAB_SPECS, tabs_id='main-tabs', active_value='joins-tab'),
+                        ]
+                    )
+                ],
+            ),
+            build_footer("Sork Lab Dashboard © 2025"),
+        ],
+    )
+
+
+def build_guest_layout():
+    return html.Div(
+        className="app-shell",
+        children=[
+            dcc.Location(id='url', refresh=False),
+            build_app_bar(
+                "Dashboard",
+                actions=[
+                    html.Span(
+                        "Log in for full access, including data uploads and flat-file downloads.",
+                        className="login-access-note",
+                    ),
+                    html.A(
+                        html.Button("Login", className="btn btn-primary btn-sm login-button"),
+                        href="/login",
+                    )
+                ],
+            ),
+            html.Main(
+                className="app-shell__body",
+                children=[
+                    build_content_frame(
+                        [
+                            html.Div(
+                                className="content-frame__header",
+                                children=[
+                                    html.Div(
+                                        [
+                                            html.P("Public Access", className="content-frame__eyebrow"),
+                                            html.H2("Shared data tools", className="content-frame__title"),
+                                            html.P(
+                                                "Browse and filter public data without an account.",
+                                                className="content-frame__subtitle",
+                                            ),
+                                        ]
+                                    ),
+                                    html.Div(id='error-message', className="login-panel__error"),
+                                ],
+                            ),
+                            build_tabs(GUEST_TAB_SPECS, tabs_id='main-tabs', active_value='joins-tab'),
+                        ]
+                    )
+                ],
+            ),
+            build_footer("Sork Lab Dashboard © 2025"),
+        ],
+    )
+
+
 def serve_layout():
 
-    dcc.Location(id='url', refresh=False)
-
-    if 'user' in session: # Authenticated layout
-        return html.Div([
-            # Main content wrapper with flexible height
-            html.Div([
-                # Header
-                html.Div(
-                    html.H1("Sork Lab Dashboard", className="text-center fw-bold"),
-                    style={"backgroundColor": '#e9ebe8', "padding": "15px"}
-                ),
-                # AUTH0 CHECK -- TEST
-                html.Div([
-                    html.Div(id='user-info', className="mb-2"),
-                    html.A(
-                        html.Button("Login", className="btn btn-primary btn-sm login-button"), 
-                        href="/login"),
-                    html.A(
-                        html.Button("Logout", className="btn btn-outline-secondary btn-sm logout-button"), 
-                        href="/logout")
-                ], className="col-3 text-end"),
-                # Tab content container
-                html.Div([
-                    html.Br(),
-                    # Give the tabs a unique ID that all components can access
-                    dcc.Tabs(id='main-tabs', value='map-tab', children=[
-                        map_layout,
-                        dataset_layout,
-                        stats_layout,
-                        joins_layout,
-                        upload_layout,
-                        download_layout,
-                    ], className="mb-4") 
-                ], className="col-8 mx-auto", style={"minHeight": "calc(100vh - 200px)"})
-            ], style={"flex": "1 0 auto"}),
-            
-            # Footer that stays at the bottom
-            html.Footer(
-                html.Div("Sork Lab Dashboard © 2025", className="text-center text-muted py-3"),
-                style={
-                    "backgroundColor": "#e9ebe8", 
-                    "color": "#e3e3e3", 
-                    "padding": "20px", 
-                    "width": "100%",
-                    "marginTop": "40px"
-                }
-            )
-        ], style={
-            "backgroundColor": "#e9ebe8", 
-            "minHeight": "100vh",
-            "display": "flex",
-            "flexDirection": "column"
-        }) 
-    else: # Not authenticated
-        return html.Div([
-            # Header
-            html.Div(
-                html.H1("Sork Lab Dashboard", className="text-center fw-bold"),
-                style={"backgroundColor": 'e9ebe8', "padding": "15px"}
-            ),
-            # Errors
-            html.Div([
-                dcc.Location(id='url', refresh=False),
-                html.Div(id='error-message'),
-            ]),
-            # Login content
-            html.Div([
-                html.Div([
-                    html.H2("Welcome to Sork Lab Dashboard", className="text-center"),
-                    html.P("Please log in to access the dashboard features.", className="text-center"),
-                    html.Div([
-                        html.A(
-                            html.Button("Login", className="btn btn-primary"),
-                            href="/login",
-                            className="d-block mx-auto",
-                            style={"width": "fit-content"}
-                        )
-                    ], className="text-center")
-                ], className="p-5 bg-white rounded shadow")
-            ], className="col-6 mx-auto mt-5"),
-
-            # Maps tab
-            html.Div([
-                html.Br(), 
-                map_layout
-            ], className="p-4 bgwhite rounded shadow mt-5", style={
-                "width": "90%", 
-                "margin": "0 auto"
-            }), 
-
-            # Footer that stays at the bottom
-            html.Footer(
-                html.Div("Sork Lab Dashboard © 2025", className="text-center text-muted py-3"),
-                style={
-                    "backgroundColor": "#e9ebe8", 
-                    "color": "#e3e3e3", 
-                    "padding": "20px", 
-                    "width": "100%",
-                    "marginTop": "40px"
-                }
-            )
-        ], style={
-            "backgroundColor": "#e9ebe8", 
-            "minHeight": "100vh",
-            "display": "flex",
-            "flexDirection": "column"
-        })
+    if 'user' in session:
+        return build_authenticated_layout()
+    return build_guest_layout()
         
 
 app.layout = serve_layout
+app.validation_layout = html.Div([
+    build_authenticated_layout(),
+    html.Div(id="error-message"),
+])
 
 
 
@@ -254,4 +310,4 @@ def display_error_message(search):
     return ""
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, use_reloader=False)

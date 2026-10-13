@@ -1,96 +1,236 @@
-from dash import dcc, html, Input, Output, State, callback, dash_table
+import logging
+
+from dash import dcc, html, Input, Output, State, callback
 from dash.exceptions import PreventUpdate
 import dash
 import pandas as pd
 import io
 import base64
-from database import fetch_data_from_sql
+from dash_ag_grid import AgGrid
+from data_access import (
+    DatabaseAccessError,
+    append_dataframe_to_holding_table,
+    get_table_display_name,
+    get_upload_template_columns,
+    get_upload_template_schema_preview,
+    get_upload_template_tables,
+)
 from dotenv import load_dotenv
-import os
 
 # Load environment variables
 load_dotenv(override=True)
 
-# Table Options
-table_options = os.getenv("TABLE_OPTIONS").split(",")
+# Table Options - create options with descriptive labels
+_table_list = get_upload_template_tables()
+table_options = [
+    {"label": get_table_display_name(table), "value": table}
+    for table in _table_list
+]
+logger = logging.getLogger(__name__)
 
-# Database connection settings from environment variables
-driver = "ODBC Driver 17 for SQL Server"
-server = os.getenv("DB_SERVER")
-database = os.getenv("DB_DATABASE")
-username = os.getenv("DB_USERNAME")
-password = os.getenv("DB_PASSWORD")
 
-# SQL Alchemy connection string
-connection_string = (
-    f"mssql+pyodbc://{username}:{password}@{server}/{database}"
-    f"?driver={driver}&Encrypt=yes&TrustServerCertificate=yes"
-)
+def _status(message, kind="warning", title=None):
+    children = []
+    if title:
+        children.append(html.H6(title, className="section-title"))
+    children.append(html.P(message, className="section-copy"))
+    return html.Div(children, className=f"status-{kind}")
+
+
+def _make_grid(df, grid_id, height=320):
+    schema_grid = grid_id == "upload-schema-grid"
+    schema_widths = {
+        "Position": {"width": 95, "minWidth": 90, "maxWidth": 120},
+        "Column": {"width": 190, "minWidth": 160},
+        "Type": {"width": 150, "minWidth": 130},
+        "Required": {"width": 280, "minWidth": 220},
+        "Description": {"width": 520, "minWidth": 360},
+    }
+    return AgGrid(
+        id=grid_id,
+        rowData=df.to_dict("records"),
+        columnDefs=[
+            {
+                "headerName": str(column),
+                "field": str(column),
+                "filter": True,
+                "sortable": True,
+                "resizable": True,
+                "wrapText": schema_grid,
+                "autoHeight": schema_grid,
+                **(schema_widths.get(str(column), {"minWidth": 120}) if schema_grid else {"minWidth": 120}),
+            }
+            for column in df.columns
+        ],
+        defaultColDef={
+            "filter": True,
+            "sortable": True,
+            "resizable": True,
+            "wrapHeaderText": schema_grid,
+            "autoHeaderHeight": schema_grid,
+        },
+        dashGridOptions={
+            "pagination": True,
+            "paginationPageSize": 10,
+            "animateRows": False,
+            "ensureDomOrder": True,
+        },
+        className=f"ag-theme-alpine compact-grid{' upload-schema-grid' if schema_grid else ''}",
+        style={"width": "100%", "height": f"{height}px"},
+    )
+
+
+def _make_simple_table(df):
+    header = html.Thead(html.Tr([html.Th(str(column)) for column in df.columns]))
+    body = html.Tbody(
+        [
+            html.Tr([html.Td("" if pd.isna(value) else str(value)) for value in row])
+            for row in df.itertuples(index=False, name=None)
+        ]
+    )
+    return html.Div(
+        html.Table([header, body], className="simple-data-table"),
+        className="simple-data-table-wrap",
+    )
+
+
+def _schema_for_display(schema_df):
+    df = schema_df.copy()
+    if df.empty:
+        return pd.DataFrame(columns=["Position", "Column", "Type", "Required", "Structure"])
+
+    def format_type(row):
+        dtype = str(row.get("DATA_TYPE", ""))
+        max_len = row.get("CHARACTER_MAXIMUM_LENGTH")
+        precision = row.get("NUMERIC_PRECISION")
+        scale = row.get("NUMERIC_SCALE")
+        if dtype.lower() in {"varchar", "nvarchar", "char", "nchar", "binary", "varbinary"} and pd.notna(max_len):
+            length = "max" if int(max_len) == -1 else str(int(max_len))
+            return f"{dtype}({length})"
+        if dtype.lower() in {"decimal", "numeric"} and pd.notna(precision):
+            return f"{dtype}({int(precision)},{int(scale or 0)})"
+        return dtype
+
+    display = pd.DataFrame(
+        {
+            "Position": df["ORDINAL_POSITION"] if "ORDINAL_POSITION" in df.columns else range(1, len(df) + 1),
+            "Column": df["COLUMN_NAME"],
+            "Type": df.apply(format_type, axis=1),
+            "Required": (
+                df["REQUIRED_RULE"]
+                if "REQUIRED_RULE" in df.columns
+                else df.get("IS_NULLABLE", pd.Series(["YES"] * len(df))).map(lambda v: "Yes" if str(v).upper() == "NO" else "No")
+            ),
+        }
+    )
+    if "COLUMN_DESCRIPTION" in df.columns:
+        display["Description"] = df["COLUMN_DESCRIPTION"]
+    return display
+
+
+def _build_template_workbook(selected_table, schema_df):
+    columns = schema_df["COLUMN_NAME"].tolist()
+    schema_display = _schema_for_display(schema_df)
+    readme = pd.DataFrame(
+        [
+            {"Item": "Target source table", "Value": selected_table},
+            {"Item": "Required format", "Value": ".xlsx workbook with a Data sheet"},
+            {"Item": "Review flow", "Value": "Rows are staged for review and are not written directly to source tables."},
+        ]
+    )
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        pd.DataFrame(columns=columns).to_excel(writer, index=False, sheet_name="Data")
+        schema_display.to_excel(writer, index=False, sheet_name="Schema")
+        readme.to_excel(writer, index=False, sheet_name="README")
+    output.seek(0)
+    return output.getvalue()
 
 upload_layout = dcc.Tab(
     [
         # Store the tab's active state
         dcc.Store(id="upload-tab-active", data=False),
-        html.Br(),
-        html.H4("Upload CSV File to Database", style={"marginBottom": "20px"}),
-        
-        # Table selection
-        html.Label("Select target table:", style={"fontWeight": "bold", "marginBottom": "5px", "fontSize": "16px"}),
-        dcc.Dropdown(table_options, id="upload_table_dropdown", placeholder="Select a table"),
-        
-        html.Div([
-            # File upload component
-            html.Div([
-                html.Label("Upload CSV file:", style={"fontWeight": "bold", "marginTop": "20px", "marginBottom": "10px"}),
-                dcc.Upload(
-                    id='upload-csv',
-                    children=html.Div([
-                        html.A('Drag and Drop or ', style={"textDecoration": "underline"}),
-                        html.A('Select a CSV File')
-                    ]),
-                    style={
-                        'width': '100%',
-                        'height': '60px',
-                        'lineHeight': '60px',
-                        'borderWidth': '1px',
-                        'borderStyle': 'dashed',
-                        'borderRadius': '5px',
-                        'textAlign': 'center',
-                        'backgroundColor': '#f9f9f9',
-                        'margin': '10px 0'
-                    },
-                    multiple=False
+        html.Div(
+            [
+                html.H4("Upload Data", className="page-title"),
+                html.P(
+                    "Upload Excel rows for review. Use the template so columns match the selected table.",
+                    className="page-intro",
                 ),
-            ]),
-            
-            # Table structure information
-            html.Div(id="table-structure-info", style={"marginTop": "20px"}),
-            
-            # Upload result or validation errors
-            html.Div(id="upload-status", style={"marginTop": "20px"}),
-            
-            # CSV preview
-            html.Div(id="csv-preview", style={"marginTop": "20px"}),
-            
-            # Upload button
-            html.Div([
-                html.Button("Upload to Database", 
-                           id="upload-button", 
-                           disabled=True,
-                           style={"marginTop": "20px", 
-                                 "padding": "10px 20px", 
-                                 "backgroundColor": "#007bff", 
-                                 "color": "white", 
-                                 "border": "none", 
-                                 "borderRadius": "4px",
-                                 "cursor": "pointer"}
-                          )
-            ]),
-            
-            # Upload result
-            html.Div(id="upload-result", style={"marginTop": "20px"})
-            
-        ], id="upload-container", style={"display": "none"})
+            ],
+            className="page-header-block",
+        ),
+        html.Div(
+            [
+                html.Div(
+                    [
+                        html.H6("Target Table", className="section-title"),
+                        dcc.Dropdown(
+                            table_options,
+                            id="upload_table_dropdown",
+                            placeholder="Choose a destination table",
+                            maxHeight=420,
+                        ),
+                        html.P("Choose the table format your workbook should follow.", className="section-copy"),
+                    ],
+                    className="panel-card upload-target-panel",
+                ),
+                html.Div(
+                    [
+                        html.Div(
+                            [
+                                html.H6("Excel File", className="section-title"),
+                                html.P("Use a .xlsx workbook with headers that match the template exactly. The first sheet or a sheet named Data will be parsed.", className="section-copy"),
+                                dcc.Upload(
+                                    id='upload-csv',
+                                    children=html.Div("Drop an .xlsx file here or select one"),
+                                    className="upload-dropzone",
+                                    multiple=False,
+                                ),
+                            ],
+                            className="panel-card",
+                        ),
+                        html.Div(
+                            [
+                                html.Button("Download .xlsx Template", id="upload-template-button", n_clicks=0, className="btn btn-outline-secondary"),
+                                dcc.Download(id="upload-template-download"),
+                            ],
+                            className="button-row",
+                        ),
+                        dcc.Loading(
+                            id="upload-structure-loading",
+                            type="default",
+                            children=html.Div(id="table-structure-info"),
+                        ),
+                        dcc.Loading(
+                            id="upload-status-loading",
+                            type="default",
+                            children=html.Div(id="upload-status"),
+                        ),
+                        dcc.Loading(
+                            id="upload-preview-loading",
+                            type="default",
+                            children=html.Div(id="csv-preview"),
+                        ),
+                        html.Div(
+                            [
+                                html.Button("Upload to Holding Table", id="upload-button", disabled=True, className="btn btn-success"),
+                            ],
+                            className="button-row",
+                        ),
+                        dcc.Loading(
+                            id="upload-result-loading",
+                            type="default",
+                            children=html.Div(id="upload-result"),
+                        ),
+                    ],
+                    id="upload-container",
+                    className="upload-workspace",
+                    style={"display": "none"},
+                ),
+            ],
+            className="upload-workspace",
+        ),
     ],
     label="Upload",
     id="upload-tab",
@@ -100,10 +240,11 @@ upload_layout = dcc.Tab(
 # Track tab selection state
 @callback(
     Output('upload-tab-active', 'data'),
-    [Input('main-tabs', 'value')]
+    [Input('main-tabs', 'value'), Input('flat-files-subtabs', 'value')]
 )
-def set_upload_tab_active(tab_value):
-    return tab_value == 'upload-tab'
+def set_upload_tab_active(main_tab, sub_tab):
+    # Active if we are on the Flat Files tab AND the upload subtab is selected
+    return main_tab == 'flat-files-tab' and sub_tab == 'upload-subtab'
 
 # Reset when tab is switched
 @callback(
@@ -119,12 +260,7 @@ def set_upload_tab_active(tab_value):
     prevent_initial_call=True
 )
 def reset_upload_tab_data(is_active):
-    if not is_active:
-        # Reset all controls when leaving the tab
-        return None, None, True, [], [], [], [], {"display": "none"}
-    else:
-        # Don't reset when entering the tab
-        return [dash.no_update] * 8
+    raise PreventUpdate
 
 # Callback to show upload container when table is selected
 @callback(
@@ -146,59 +282,57 @@ def display_table_structure(selected_table):
         return []
     
     try:
-        # Get a sample row to determine columns and types
-        sample_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
+        schema_df = get_upload_template_schema_preview(selected_table)
+        schema_display = _schema_for_display(schema_df)
         
-        # Get column details
-        columns = sample_df.columns.tolist()
-        dtypes = sample_df.dtypes.to_dict()
-        
-        # Create table structure information
         structure_info = [
-            html.H5("Table Structure", style={"marginBottom": "10px"}),
-            html.P(f"This table has {len(columns)} columns:", style={"marginBottom": "5px"}),
-            html.Div([
-                dash_table.DataTable(
-                    data=[{"Column": col, "Data Type": str(dtypes[col])} for col in columns],
-                    columns=[
-                        {"name": "Column", "id": "Column"},
-                        {"name": "Data Type", "id": "Data Type"}
-                    ],
-                    style_table={'overflowX': 'auto'},
-                    style_cell={
-                        'textAlign': 'left',
-                        'padding': '8px',
-                        'minWidth': '100px',
-                    },
-                    style_header={
-                        'backgroundColor': '#d1d1d1',
-                        'fontWeight': 'bold'
-                    },
-                )
-            ])
+            html.H6("Expected Upload Structure", className="section-title"),
+            html.P(
+                f"This upload type expects {len(schema_display)} columns. Keep the Excel headers and order exactly as shown.",
+                className="section-copy",
+            ),
+            html.P(
+                "If database type metadata is unavailable, the preview still shows the verified source columns and marks type details as unavailable.",
+                className="section-copy",
+            ),
+            html.P(
+                "Uploaded rows are staged for review before they are added to source data.",
+                className="section-copy",
+            ),
+            _make_grid(
+                schema_display,
+                "upload-schema-grid",
+                height=340,
+            ),
         ]
         
-        return structure_info
-    except Exception as e:
-        return html.Div([
-            html.H5("Error Retrieving Table Structure", style={"color": "red"}),
-            html.P(str(e))
-        ])
+        return html.Div(structure_info, className="panel-card")
+    except DatabaseAccessError as e:
+        logger.exception("Unable to load upload table structure for %s", selected_table)
+        return _status("Table structure is unavailable right now. Choose another table or try again later.", "warning", "Table structure unavailable")
 
-# Function to parse CSV content
-def parse_csv(contents):
+def parse_excel(contents, filename=None):
     if contents is None:
         return None, None
-    content_type, content_string = contents.split(',')
+    if not (filename or "").lower().endswith(".xlsx"):
+        return None, "Uploads must be Excel .xlsx files. Download the template and save your rows as .xlsx before uploading."
+
+    content_type, content_string = contents.split(',', 1)
     decoded = base64.b64decode(content_string)
     
     try:
-        df = pd.read_csv(io.StringIO(decoded.decode('utf-8')))
+        workbook = pd.ExcelFile(io.BytesIO(decoded), engine="openpyxl")
+        sheet_name = "Data" if "Data" in workbook.sheet_names else workbook.sheet_names[0]
+        df = pd.read_excel(workbook, sheet_name=sheet_name)
+        df = df.dropna(how="all")
+        if df.empty:
+            return None, "The Excel workbook was read successfully but contains no data rows."
         return df, None
     except Exception as e:
-        return None, f"Error parsing CSV: {str(e)}"
+        logger.exception("Unable to parse uploaded Excel workbook")
+        return None, "The Excel file could not be read. Confirm it is a valid .xlsx workbook with a header row."
 
-# Callback to validate CSV file and display preview
+# Callback to validate Excel file and display preview
 @callback(
     [Output("csv-preview", "children"),
      Output("upload-status", "children"),
@@ -212,47 +346,52 @@ def validate_and_preview_csv(contents, selected_table, filename):
         return [], [], True
     
     try:
-        # Get table structure from database
-        sample_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
-        table_columns = sample_df.columns.tolist()
+        table_columns = get_upload_template_columns(selected_table)
         
-        # Parse the uploaded CSV
-        df, error = parse_csv(contents)
+        df, error = parse_excel(contents, filename)
         if error:
-            return [], html.Div([
-                html.H5("Error", style={"color": "red"}),
-                html.P(error)
-            ]), True
+            return [], _status(error, "error", "Excel file could not be read"), True
         
-        # Verify column count matches
+        # Verify column names and order match. The database insert maps by name now,
+        # so this prevents silent misloads when a same-width workbook is arranged differently.
         if len(df.columns) != len(table_columns):
             return get_preview_table(df), html.Div([
-                html.H5("Validation Error", style={"color": "red"}),
-                html.P(f"CSV file has {len(df.columns)} columns, but the database table has {len(table_columns)} columns."),
-                html.P("Column counts must match to proceed.")
-            ]), True
+                html.H6("Validation Error", className="section-title"),
+                html.P(f"{filename or 'This workbook'} has {len(df.columns)} columns, but '{selected_table}' expects {len(table_columns)}.", className="section-copy"),
+                html.P("Column counts must match to proceed.", className="section-copy"),
+                html.P(f"Expected order: {', '.join(table_columns)}", className="section-copy")
+            ], className="status-error"), True
+        if list(df.columns) != table_columns:
+            return get_preview_table(df), html.Div([
+                html.H6("Validation Error", className="section-title"),
+                html.P("Column names and order must match the template before upload.", className="section-copy"),
+                html.P(f"Expected order: {', '.join(table_columns)}", className="section-copy"),
+                html.P(f"Uploaded order: {', '.join(map(str, df.columns))}", className="section-copy")
+            ], className="status-error"), True
         
-        # Check for consistent row lengths (all rows have same number of columns)
-        if df.isnull().any(axis=1).sum() > 0:
-            # Some rows have missing values, but we'll convert them to None/NULL on upload
+        missing_rows = int(df.isnull().any(axis=1).sum())
+        if missing_rows > 0:
             warning = html.Div([
-                html.H5("Warning", style={"color": "orange"}),
-                html.P(f"CSV file has some rows with missing values. These will be converted to NULL in the database."),
-                html.P("Preview below shows data as it will be uploaded.")
-            ])
+                html.H6("Ready with Warnings", className="section-title"),
+                html.P(
+                    f"{filename or 'This workbook'} has {missing_rows} row(s) with missing values. Empty cells will be uploaded as NULL.",
+                    className="section-copy",
+                ),
+                html.P(f"Expected destination columns: {', '.join(table_columns)}", className="section-copy"),
+                html.P("Preview below shows the rows that will be staged for review.", className="section-copy")
+            ], className="status-warning")
         else:
             warning = html.Div([
-                html.H5("Validation Successful", style={"color": "green"}),
-                html.P(f"CSV file with {len(df)} rows is ready to upload to table '{selected_table}'.")
-            ])
+                html.H6("Ready to Upload", className="section-title"),
+                html.P(f"{filename or 'This workbook'} with {len(df)} rows is ready to stage for review.", className="section-copy"),
+                html.P(f"Expected source columns: {', '.join(table_columns)}", className="section-copy")
+            ], className="status-success")
         
         return get_preview_table(df), warning, False
         
-    except Exception as e:
-        return [], html.Div([
-            html.H5("Error", style={"color": "red"}),
-            html.P(str(e))
-        ]), True
+    except DatabaseAccessError as e:
+        logger.exception("Unable to validate upload for %s", selected_table)
+        return [], _status("Validation is unavailable right now. Try another table or try again later.", "warning", "Validation unavailable"), True
 
 # Helper function to create preview table
 def get_preview_table(df):
@@ -260,30 +399,15 @@ def get_preview_table(df):
     df_preview = df.head(preview_rows)
     
     return [
-        html.H5("CSV Preview", style={"marginBottom": "10px"}),
-        html.P(f"Showing first {preview_rows} of {len(df)} rows:", style={"marginBottom": "5px"}),
-        dash_table.DataTable(
-            data=df_preview.to_dict('records'),
-            columns=[{"name": str(i), "id": str(i)} for i in df_preview.columns],
-            style_table={'overflowX': 'auto'},
-            style_cell={
-                'textAlign': 'left',
-                'padding': '8px',
-                'minWidth': '100px',
-                'maxWidth': '200px',
-                'overflow': 'hidden',
-                'textOverflow': 'ellipsis',
-            },
-            style_header={
-                'backgroundColor': '#d1d1d1',
-                'fontWeight': 'bold'
-            },
-            tooltip_delay=0,
-            tooltip_duration=None,
-            page_size=10,
+        html.Div(
+            [
+                html.H6("Excel Preview", className="section-title"),
+                html.P(f"Showing first {preview_rows} of {len(df)} rows.", className="section-copy"),
+                _make_simple_table(df_preview),
+            ],
+            className="panel-card",
         )
     ]
-"""
 # Callback to handle database upload
 @callback(
     Output("upload-result", "children"),
@@ -293,41 +417,48 @@ def get_preview_table(df):
      State("upload-csv", "filename")]
 )
 def upload_to_database(n_clicks, contents, selected_table, filename):
-    if n_clicks is None or contents is None or selected_table is None:
+    if not n_clicks or contents is None or selected_table is None:
         raise PreventUpdate
     
     try:
-        # Parse the uploaded CSV
-        df, error = parse_csv(contents)
+        df, error = parse_excel(contents, filename)
         if error:
-            return html.Div([
-                html.H5("Upload Error", style={"color": "red"}),
-                html.P(error)
-            ])
+            return _status(error, "error", "Upload Error")
         
-        # Get table structure
-        sample_df = fetch_data_from_sql(f"SELECT TOP 1 * FROM [dbo].[{selected_table}]")
-        table_columns = sample_df.columns.tolist()
-        
-        # Rename CSV columns to match database columns
-        if len(df.columns) == len(table_columns):
-            df.columns = table_columns
-        
-        # Create database connection
-        engine = create_engine(connection_string, fast_executemany=True)
-        
-        # Upload data to the database
-        with engine.begin() as connection:
-            df.to_sql(selected_table, connection, if_exists='append', index=False, schema='dbo')
+        upload_result = append_dataframe_to_holding_table(selected_table, df, filename=filename)
         
         return html.Div([
-            html.H5("Upload Successful", style={"color": "green"}),
-            html.P(f"Successfully uploaded {len(df)} rows to table '{selected_table}'.")
-        ])
+            html.H6("Upload Staged", className="section-title"),
+            html.P(
+                f"Staged {upload_result['rows']} rows from '{filename or 'uploaded file'}' for review.",
+                className="section-copy",
+            ),
+        ], className="status-success")
         
-    except Exception as e:
-        return html.Div([
-            html.H5("Upload Error", style={"color": "red"}),
-            html.P(str(e))
-        ])
-"""
+    except DatabaseAccessError as e:
+        logger.exception("Unable to stage Excel upload for %s", selected_table)
+        return _status("Upload failed before rows were staged. Check that the workbook still matches the template and try again.", "error", "Upload Error")
+
+
+@callback(
+    Output("upload-template-download", "data"),
+    Input("upload-template-button", "n_clicks"),
+    State("upload_table_dropdown", "value"),
+    prevent_initial_call=True,
+)
+def download_upload_template(n_clicks, selected_table):
+    if not n_clicks or not selected_table:
+        raise PreventUpdate
+
+    try:
+        schema_df = get_upload_template_schema_preview(selected_table)
+        workbook_bytes = _build_template_workbook(selected_table, schema_df)
+        filename = f"{selected_table}_upload_template.xlsx"
+        return dcc.send_bytes(
+            workbook_bytes,
+            filename,
+            type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except DatabaseAccessError:
+        logger.exception("Unable to generate upload template for %s", selected_table)
+        raise PreventUpdate
